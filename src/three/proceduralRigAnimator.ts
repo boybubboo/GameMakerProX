@@ -83,7 +83,8 @@ export type RigTestOverride =
   | { kind: 'manualBone'; boneName: string; rxDeg: number; ryDeg: number; rzDeg: number }
   | { kind: 'poseSnapshot'; bones: Record<string, BonePoseAngles>; hipsOffsetY?: number }
   | { kind: 'presetPreview'; preset: CustomMotionPreset; timeNorm: number; playing: boolean }
-  | { kind: 'glide'; sway?: number; steerBank?: number };
+  | { kind: 'glide'; sway?: number; steerBank?: number }
+  | { kind: 'block'; speedNorm?: number };
 
 // Reusable scratch math objects (zero allocations inside per-frame animation update)
 const _qDeltaChar = new THREE.Quaternion();
@@ -388,9 +389,9 @@ export function collectRiggableNodes(root: THREE.Object3D): {
     return { nodes: ordered, isSkinned: skinnedMeshCount > 0, skinnedMeshCount };
   }
 
-  // Fallback for non-skinned articulated character hierarchies (e.g. separate Head / LeftArm / Leg nodes)
+  // Fallback for non-skinned articulated character hierarchies (e.g. HeroRig, NPC, Buddy, Baddie nodes)
   const partPattern =
-    /(head|neck|spine|chest|torso|hips|pelvis|arm|forearm|hand|leg|thigh|shin|calf|foot|shoulder)/i;
+    /(head|neck|spine|chest|torso|hips|pelvis|arm|forearm|hand|leg|thigh|shin|calf|foot|shoulder|tail|wing|jaw|body_?pivot|knee|paw)/i;
   root.traverse((obj) => {
     if (obj !== root && obj.name && partPattern.test(obj.name)) {
       pushUnique(obj);
@@ -442,33 +443,34 @@ function matchBoneMapByName(nodes: THREE.Object3D[]): Partial<Record<RigBoneRole
   };
 
   map.hips = pick((e) => {
-    if (/^(hips|pelvis|hip|root_hip|cog|mixamorig_hips)$/.test(e.norm)) return 10;
-    if (/(hips|pelvis)/.test(e.norm) && !e.side) return 8;
+    if (/^(hips|pelvis|hip|root_hip|cog|mixamorig_hips|monster_?body_?pivot|monster_?hips)$/.test(e.norm)) return 10;
+    if (/(hips|pelvis|body_?pivot)/.test(e.norm) && !e.side) return 8;
     return 0;
   });
 
   map.head = pick((e) => {
-    if (/head_?end|headtop|hair|hat|eye|jaw|ear|brow|teeth|tongue/.test(e.norm)) return 0;
-    if (/^(head|skull|cranium)$/.test(e.norm)) return 10;
+    if (/head_?end|headtop|hair|hat|eye|jaw|ear|brow|teeth|tongue|anchor/.test(e.norm)) return 0;
+    if (/^(head|skull|cranium|monster_?head_?0)$/.test(e.norm)) return 10;
     if (/head/.test(e.norm) && !e.side) return 7;
     return 0;
   });
 
   map.neck = pick((e) => {
-    if (/^(neck|neck_?0?1)$/.test(e.norm)) return 10;
+    if (/^(neck|neck_?0?1|monster_?neck_?0_?0)$/.test(e.norm)) return 10;
     if (/neck/.test(e.norm) && !e.side) return 7;
     return 0;
   });
 
   map.chest = pick((e) => {
-    if (/^(chest|upper_?chest|spine_?0?2|spine_?0?3|thorax)$/.test(e.norm)) return 10;
+    if (/anchor/.test(e.norm)) return 0;
+    if (/^(chest|upper_?chest|spine_?0?2|spine_?0?3|thorax|monster_?chest)$/.test(e.norm)) return 10;
     if (/(chest|upper_?chest|spine2)/.test(e.norm) && !e.side) return 8;
     return 0;
   });
 
   map.spine = pick((e) => {
     if (e.name === map.chest) return 0;
-    if (/^(spine|spine_?0?1|waist|torso|abdomen)$/.test(e.norm)) return 10;
+    if (/^(spine|spine_?0?1|waist|torso|abdomen|monster_?torso)$/.test(e.norm)) return 10;
     if (/(spine|waist|torso)/.test(e.norm) && !e.side) return 7;
     return 0;
   });
@@ -485,17 +487,22 @@ function matchBoneMapByName(nodes: THREE.Object3D[]): Partial<Record<RigBoneRole
         if (/shoulder/.test(n)) return 2; // low fallback only if no upper arm exists
         if (/(upper_?arm|up_?arm|u_?arm|humerus)/.test(n)) return 10;
         if (/(^|_)arm($|_|\d)|arm_/.test(n)) return 8;
+        if (/wing_?(l|r)_?inner/.test(n)) return 6;
+        if (/leg_?0_?(l|r)_?hip/.test(n)) return 4;
         return 0;
       }
       if (kind === 'lowerArm') {
         if (/hand|wrist|finger|thumb|twist/.test(n)) return 0;
         if (/(fore_?arm|lower_?arm|low_?arm|l_?arm|elbow|radius|ulna)/.test(n)) return 10;
+        if (/wing_?(l|r)_?outer/.test(n)) return 6;
+        if (/leg_?0_?(l|r)_?knee/.test(n)) return 4;
         return 0;
       }
       if (kind === 'upperLeg') {
         if (/lower|shin|calf|knee|foot|ankle|toe|twist/.test(n)) return 0;
         if (/(up_?leg|upper_?leg|thigh|femur|hip_leg)/.test(n)) return 10;
         if (/(^|_)leg($|_|\d)/.test(n)) return 5;
+        if (/leg_?[123]_?(l|r)_?hip/.test(n)) return 6;
         return 0;
       }
       if (kind === 'lowerLeg') {
@@ -503,6 +510,7 @@ function matchBoneMapByName(nodes: THREE.Object3D[]): Partial<Record<RigBoneRole
         if (/(lower_?leg|low_?leg|shin|calf|knee|tibia)/.test(n)) return 10;
         // Mixamo uses LeftUpLeg + LeftLeg for thigh + shin
         if (/(^|_)leg($|_|\d)/.test(n)) return 8;
+        if (/leg_?[123]_?(l|r)_?knee/.test(n)) return 6;
         return 0;
       }
       return 0;
@@ -1085,19 +1093,79 @@ export class ProceduralRigController {
     cap.node.quaternion.copy(_qDeltaLocal).multiply(cap.restQuat);
   }
 
+  private resolvePresetBoneTarget(presetBoneName: string): CapturedBone | undefined {
+    const direct = this.allBones.get(presetBoneName);
+    if (direct) return direct;
+    // Role-based fallback if the preset was saved with canonical role keys or another rig's bone names
+    const mappedByRole = this.settings.boneMap[presetBoneName as RigBoneRole];
+    if (mappedByRole) {
+      const cap = this.allBones.get(mappedByRole);
+      if (cap) return cap;
+    }
+    const lower = presetBoneName.toLowerCase();
+    const roleAlias: Record<string, RigBoneRole> = {
+      hips: 'hips',
+      monsterbodypivot: 'hips',
+      monsterhips: 'hips',
+      spine: 'spine',
+      monstertorso: 'spine',
+      chest: 'chest',
+      monsterchest: 'chest',
+      neck: 'neck',
+      monsterneck_0_0: 'neck',
+      head: 'head',
+      monsterhead_0: 'head',
+      leftupperarm: 'leftUpperArm',
+      leftlowerarm: 'leftLowerArm',
+      rightupperarm: 'rightUpperArm',
+      rightlowerarm: 'rightLowerArm',
+      leftupperleg: 'leftUpperLeg',
+      leftlowerleg: 'leftLowerLeg',
+      rightupperleg: 'rightUpperLeg',
+      rightlowerleg: 'rightLowerLeg',
+    };
+    const role = roleAlias[lower];
+    if (role) {
+      const mapped = this.settings.boneMap[role];
+      if (mapped) {
+        const cap = this.allBones.get(mapped);
+        if (cap) return cap;
+      }
+    }
+    return undefined;
+  }
+
+  public getHipsHeightRef(): number {
+    const hipsName = this.settings.boneMap.hips;
+    const hipsCap = hipsName ? this.allBones.get(hipsName) : undefined;
+    if (hipsCap && Math.abs(hipsCap.restPos.y) > 0.05) {
+      return Math.abs(hipsCap.restPos.y);
+    }
+    return 0.72;
+  }
+
   /**
    * Applies a complete pose snapshot map + optional hips vertical offset cleanly from bind pose.
    */
-  public applyPoseSnapshot(bones: Record<string, BonePoseAngles>, hipsOffsetY = 0) {
+  public applyPoseSnapshot(bones: Record<string, BonePoseAngles>, hipsOffsetY = 0, hipsHeightRef?: number) {
     this.resetToRestPose();
     for (const [boneName, angles] of Object.entries(bones)) {
-      this.applyCharSpaceBoneAngles(boneName, angles);
+      const cap = this.resolvePresetBoneTarget(boneName);
+      if (cap) {
+        this.applyCharSpaceBoneAngles(cap.node.name, angles);
+      }
     }
     if (Math.abs(hipsOffsetY) > 0.0005) {
       const hipsName = this.settings.boneMap.hips;
       const hipsCap = hipsName ? this.allBones.get(hipsName) : undefined;
       if (hipsCap) {
-        hipsCap.node.position.y = hipsCap.restPos.y + hipsOffsetY;
+        const targetRef = this.getHipsHeightRef();
+        const scaleRatio =
+          hipsHeightRef && hipsHeightRef > 0.05
+            ? THREE.MathUtils.clamp(targetRef / hipsHeightRef, 0.35, 2.8)
+            : 1;
+        const scaledOffset = hipsOffsetY * scaleRatio;
+        hipsCap.node.position.y = Math.max(-hipsCap.restPos.y + 0.05, hipsCap.restPos.y + scaledOffset);
       }
     }
   }
@@ -1110,11 +1178,13 @@ export class ProceduralRigController {
     const seg = resolveKeyframeSegment(preset, timeNorm);
     if (!seg) return;
     const { keyA, keyB, alpha } = seg;
+    const appliedTargets = new Set<string>();
 
     // Collect union of bones present in either bracketing keyframe
     for (const [name, anglesA] of Object.entries(keyA.bones)) {
-      const cap = this.allBones.get(name);
+      const cap = this.resolvePresetBoneTarget(name);
       if (!cap) continue;
+      appliedTargets.add(cap.node.name);
       const anglesB = keyB.bones[name];
       _eulerA.set(
         THREE.MathUtils.degToRad(anglesA[0]),
@@ -1144,8 +1214,9 @@ export class ProceduralRigController {
 
     for (const [name, anglesB] of Object.entries(keyB.bones)) {
       if (name in keyA.bones) continue;
-      const cap = this.allBones.get(name);
-      if (!cap) continue;
+      const cap = this.resolvePresetBoneTarget(name);
+      if (!cap || appliedTargets.has(cap.node.name)) continue;
+      appliedTargets.add(cap.node.name);
       _qPoseA.identity();
       _eulerB.set(
         THREE.MathUtils.degToRad(anglesB[0]),
@@ -1167,7 +1238,16 @@ export class ProceduralRigController {
       const hipsName = this.settings.boneMap.hips;
       const hipsCap = hipsName ? this.allBones.get(hipsName) : undefined;
       if (hipsCap) {
-        hipsCap.node.position.y = hipsCap.restPos.y + hipsY;
+        const targetRef = this.getHipsHeightRef();
+        const scaleRatio =
+          preset.hipsHeightRef && preset.hipsHeightRef > 0.05
+            ? THREE.MathUtils.clamp(targetRef / preset.hipsHeightRef, 0.35, 2.8)
+            : 1;
+        const scaledY = hipsY * scaleRatio;
+        const minAllowY = preset.slot === 'dying' || preset.slot === 'sleep' || preset.slot === 'knockdown'
+          ? 0.04
+          : Math.max(0.06, hipsCap.restPos.y * 0.12);
+        hipsCap.node.position.y = Math.max(minAllowY, hipsCap.restPos.y + scaledY);
       }
     }
   }
@@ -1391,6 +1471,61 @@ export class ProceduralRigController {
       }
       cap.node.quaternion.copy(cap.restQuat).multiply(_qDeltaLocal);
     }
+  }
+
+  /**
+   * Applies a character-space delta onto a child bone (such as lower arm) using its parent's
+   * LIVE animated orientation so elbow bends work cleanly regardless of upper-arm twist/relaxation.
+   */
+  private applyCharSpacePoseLiveParent(
+    role: RigBoneRole,
+    pitchX: number,
+    yawY: number,
+    rollZ: number,
+    isRightSide = false
+  ) {
+    if (this.settings.limbSwingAxis !== 'auto') {
+      this.applyCharSpacePose(role, pitchX, yawY, rollZ, isRightSide);
+      return;
+    }
+    const boneName = this.settings.boneMap[role];
+    if (!boneName) return;
+    const cap = this.allBones.get(boneName);
+    if (!cap) return;
+
+    this.charRoot.updateWorldMatrix(true, false);
+    this.charRoot.getWorldQuaternion(_qRootWorld);
+    _qRootInv.copy(_qRootWorld).invert();
+
+    if (cap.node.parent) {
+      cap.node.parent.updateWorldMatrix(true, false);
+      cap.node.parent.getWorldQuaternion(_qParentLive);
+      _qParentLive.premultiply(_qRootInv);
+    } else {
+      _qParentLive.identity();
+    }
+    _qParentLiveInv.copy(_qParentLive).invert();
+
+    _qDeltaChar.identity();
+    if (Math.abs(rollZ) > 0.0001) {
+      _qStep.setFromAxisAngle(CHAR_Z, rollZ);
+      _qDeltaChar.premultiply(_qStep);
+    }
+    if (Math.abs(pitchX) > 0.0001) {
+      _qStep.setFromAxisAngle(CHAR_X, pitchX);
+      _qDeltaChar.premultiply(_qStep);
+    }
+    if (Math.abs(yawY) > 0.0001) {
+      _qStep.setFromAxisAngle(CHAR_Y, yawY);
+      _qDeltaChar.premultiply(_qStep);
+    }
+
+    _qDeltaLocal
+      .copy(_qParentLiveInv)
+      .multiply(_qDeltaChar)
+      .multiply(_qParentLive);
+
+    cap.node.quaternion.copy(_qDeltaLocal).multiply(cap.restQuat);
   }
 
   private getArmRelaxRoll(
@@ -1638,6 +1773,37 @@ export class ProceduralRigController {
       this.applyCharSpacePose('leftLowerLeg', 0.38, 0, 0, false);
       this.applyCharSpacePose('rightLowerLeg', 0.48, 0, 0, true);
       this.smoothLiveBoneQuaternions(clampedDt, 14);
+      return;
+    }
+
+    // 2c. Shield Guard Pose (left arm & forearm raised across chest holding off-hand shield forward)
+    if (this.testOverride && this.testOverride.kind === 'block') {
+      const spdN = THREE.MathUtils.clamp(this.testOverride.speedNorm ?? 0, 0, 1.2);
+      const isLocomoting = spdN > 0.08;
+      if (isLocomoting) {
+        this.locoPhase = (this.locoPhase + clampedDt * 5.2 * Math.max(0.35, spdN)) % (Math.PI * 200);
+      }
+      const stride = isLocomoting ? Math.cos(this.locoPhase) * 0.44 * Math.min(1, spdN) : 0;
+      const kneeL = isLocomoting ? Math.max(0.08, Math.sin(this.locoPhase) * 0.65) : 0.14;
+      const kneeR = isLocomoting ? Math.max(0.08, -Math.sin(this.locoPhase) * 0.65) : 0.12;
+
+      this.applyCharSpacePose('hips', 0.08, 0.2, 0);
+      this.applyCharSpacePose('spine', 0.1, 0.18, 0);
+      this.applyCharSpacePose('chest', 0.08, 0.16, 0);
+      this.applyCharSpacePose('head', -0.05, -0.22 * headMult, 0);
+
+      // Left arm raises forward & across chest with live-parent elbow bend so shield faces +Z in front
+      this.applyCharSpacePose('leftUpperArm', -0.62, -0.65, leftRelax - 0.16, false);
+      this.applyCharSpacePoseLiveParent('leftLowerArm', -0.96, -0.12, 0, false);
+      // Right sword arm holds ready at hip
+      this.applyCharSpacePose('rightUpperArm', -0.28 - stride * 0.25, -0.15, rightRelax, true);
+      this.applyCharSpacePose('rightLowerArm', -0.45, 0, 0, true);
+
+      this.applyCharSpacePose('leftUpperLeg', -stride - 0.08, 0, 0, false);
+      this.applyCharSpacePose('rightUpperLeg', stride + 0.06, 0, 0, true);
+      this.applyCharSpacePose('leftLowerLeg', kneeL, 0, 0, false);
+      this.applyCharSpacePose('rightLowerLeg', kneeR, 0, 0, true);
+      this.smoothLiveBoneQuaternions(clampedDt, 18);
       return;
     }
 

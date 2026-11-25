@@ -288,6 +288,32 @@ export const ItemThumbnailArt: React.FC<ItemThumbnailArtProps> = ({
           <circle cx="52" cy="35" r="2.6" fill="#92400E" stroke="#F7E8CF" strokeWidth="1" />
         </g>
       )}
+
+      {meshKind === 'shield' && (
+        <g>
+          <path
+            d="M16 14L32 10L48 14V31C48 43 39 50 32 54C25 50 16 43 16 31V14Z"
+            fill={colorHex}
+            stroke="#E2E8F0"
+            strokeWidth="2.2"
+            strokeLinejoin="round"
+          />
+          <path
+            d="M32 12V51"
+            stroke="#0F172A"
+            strokeOpacity="0.28"
+            strokeWidth="2"
+          />
+          <path
+            d="M18 26H46"
+            stroke="#E2E8F0"
+            strokeOpacity="0.55"
+            strokeWidth="2"
+          />
+          <circle cx="32" cy="29" r="5.2" fill="#CBD5E1" stroke="#475569" strokeWidth="1.4" />
+          <circle cx="31" cy="28" r="1.8" fill="#FFFFFF" fillOpacity="0.7" />
+        </g>
+      )}
     </svg>
   );
 };

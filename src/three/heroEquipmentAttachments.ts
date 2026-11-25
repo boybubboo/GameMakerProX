@@ -12,7 +12,7 @@ export interface HeroEquipmentHandles {
   fishingRodTip?: THREE.Object3D;
   torch?: THREE.Group;
   heldGeneric?: THREE.Mesh;
-  shield?: THREE.Mesh;
+  shield?: THREE.Group | THREE.Mesh;
   wearHeadHat?: THREE.Group;
   wearHeadCrown?: THREE.Group;
   wearBodyCloak?: THREE.Group | THREE.Mesh;
@@ -1055,11 +1055,40 @@ export function attachEquipmentToCustomModel(
     'HeroEquip_LeftHandAnchor'
   );
 
+  // Off-hand Shield attached to Left Hand / Forearm Anchor
+  const customShield = new THREE.Group();
+  customShield.name = 'HeroEquip_Shield';
+  customShield.position.set(0.09 * heroScale, 0.02 * heroScale, 0.08 * heroScale);
+  customShield.rotation.set(0.04, -0.22, 0);
+  const shieldFaceMat = new THREE.MeshStandardMaterial({ color: '#B47634', roughness: 0.62, flatShading: true });
+  const shieldRimMat = new THREE.MeshStandardMaterial({ color: '#94A3B8', roughness: 0.35, metalness: 0.52 });
+  const shieldBoard = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.26 * heroScale, 0.21 * heroScale, 0.05 * heroScale, 8),
+    shieldFaceMat
+  );
+  shieldBoard.rotation.z = Math.PI / 2;
+  shieldBoard.scale.set(1.16, 1, 0.92);
+  shieldBoard.castShadow = true;
+  const shieldRim = new THREE.Mesh(
+    new THREE.TorusGeometry(0.24 * heroScale, 0.024 * heroScale, 6, 12),
+    shieldRimMat
+  );
+  shieldRim.rotation.y = Math.PI / 2;
+  shieldRim.scale.set(0.92, 1.12, 1);
+  const shieldBoss = new THREE.Mesh(new THREE.SphereGeometry(0.062 * heroScale, 8, 6), shieldRimMat);
+  shieldBoss.position.set(0.032 * heroScale, 0, 0);
+  shieldBoss.scale.set(0.55, 1, 1);
+  customShield.userData.tintMeshes = [shieldBoard];
+  customShield.add(shieldBoard, shieldRim, shieldBoss);
+  customShield.visible = false;
+  leftHandAnchor.add(customShield);
+
   // Match project visual style on all newly constructed equipment meshes
   applyBotwStyleToObject(headAnchor, visualStyle);
   applyBotwStyleToObject(cloakAnchor, visualStyle);
   applyBotwStyleToObject(amuletAnchor, visualStyle);
   applyBotwStyleToObject(handAnchor, visualStyle);
+  applyBotwStyleToObject(leftHandAnchor, visualStyle);
 
   // Restore original root transform cleanly
   heroCustom.group.position.copy(prevPos);
@@ -1076,6 +1105,7 @@ export function attachEquipmentToCustomModel(
     fishingRodTip: held.fishingRodTip,
     torch: held.torch,
     heldGeneric: held.heldGeneric,
+    shield: customShield,
     wearHeadHat,
     wearHeadCrown,
     wearBodyCloak,
@@ -1108,6 +1138,7 @@ export function syncHeroEquipmentVisuals(
   handles: HeroEquipmentHandles,
   opts: {
     heldDef: InventoryItemDef | null;
+    offhandDef?: InventoryItemDef | null;
     headDef: InventoryItemDef | null;
     bodyDef: InventoryItemDef | null;
     accDef: InventoryItemDef | null;
@@ -1115,10 +1146,12 @@ export function syncHeroEquipmentVisuals(
     isAttacking: boolean;
     isFishingActive: boolean;
     isGliding?: boolean;
+    isBlocking?: boolean;
   }
 ): void {
   const {
     heldDef,
+    offhandDef,
     headDef,
     bodyDef,
     accDef,
@@ -1126,9 +1159,12 @@ export function syncHeroEquipmentVisuals(
     isAttacking,
     isFishingActive,
     isGliding,
+    isBlocking,
   } = opts;
   const heldTool = heldDef?.toolKind ?? null;
   const showHandProp = !isGliding && (!isSwimming || isAttacking);
+  const twoHandedHeld =
+    heldDef?.handedness === 'twoHand' || heldTool === 'axe' || heldTool === 'fishingPole';
 
   if (handles.sword) handles.sword.visible = showHandProp && heldTool === 'sword';
   if (handles.axe) handles.axe.visible = showHandProp && heldTool === 'axe';
@@ -1150,8 +1186,17 @@ export function syncHeroEquipmentVisuals(
     }
   }
   if (handles.shield) {
-    handles.shield.visible =
-      !isGliding && !isSwimming && heldTool !== 'axe' && heldTool !== 'fishingPole';
+    const showShield = Boolean(offhandDef) && !isGliding && !isSwimming && !twoHandedHeld;
+    handles.shield.visible = showShield;
+    if (showShield && offhandDef) {
+      applyTintToHandle(handles.shield, offhandDef.wearColorHex ?? offhandDef.colorHex);
+      // Turn shield face forward (+Z) across the front guard when actively raised
+      handles.shield.rotation.set(
+        isBlocking ? 0.35 : 0.04,
+        isBlocking ? -0.18 : -0.22,
+        isBlocking ? -0.38 : 0
+      );
+    }
   }
 
   const isCrownItem = Boolean(

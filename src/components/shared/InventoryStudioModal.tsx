@@ -54,6 +54,7 @@ const MESH_OPTIONS: { kind: PickupMeshKind; label: string; defaultIcon: string }
   { kind: 'hat', label: 'Hat / Crown', defaultIcon: 'crown' },
   { kind: 'cloak', label: 'Cloak', defaultIcon: 'shirt' },
   { kind: 'armor', label: 'Armor', defaultIcon: 'shield' },
+  { kind: 'shield', label: 'Shield (Off-Hand)', defaultIcon: 'shield' },
   { kind: 'amulet', label: 'Amulet', defaultIcon: 'shield' },
   { kind: 'woodLog', label: 'Wood Log', defaultIcon: 'trees' },
   { kind: 'fish', label: 'Fish', defaultIcon: 'fish' },
@@ -885,6 +886,7 @@ export const InventoryStudioModal: React.FC<{
                             <option value="head">Headgear</option>
                             <option value="body">Body / Armor</option>
                             <option value="accessory">Accessory</option>
+                            <option value="offhand">Off-Hand (Shield)</option>
                           </select>
                         </div>
                         <div className="space-y-1">

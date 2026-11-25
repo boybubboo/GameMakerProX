@@ -44,6 +44,7 @@ import type {
   WorldCollectibleRule,
 } from '../types/maker';
 import { createDefaultFxEmitterConfig } from './fxEmitterPresets';
+import { createShowcaseTwinFlameDrakeBlueprint } from './baddieActionLibrary';
 import { DEFAULT_ROGUELIKE_CONFIG, generateRoguelikeFloor } from './roguelikeEngine';
 import {
   BuddiesLandmarks,
@@ -454,8 +455,8 @@ export const BehaviorVocabulary = {
   events: [
     { key: 'levelStarts', label: 'the level starts', needsDetail: false, detailHint: '', symbol: 'flag.fill' },
     { key: 'playerTouches', label: 'the player touches me', needsDetail: false, detailHint: '', symbol: 'hand.tap.fill' },
-    { key: 'playerNear', label: 'the player comes near', needsDetail: false, detailHint: '', symbol: 'figure.walk' },
-    { key: 'seesPlayer', label: 'I see the player', needsDetail: false, detailHint: '', symbol: 'eye.fill' },
+    { key: 'playerNear', label: 'the player comes near', needsDetail: true, detailHint: '14m (optional range)', symbol: 'figure.walk' },
+    { key: 'seesPlayer', label: 'I see the player', needsDetail: true, detailHint: '24m sight or spatial (optional)', symbol: 'eye.fill' },
     { key: 'takesDamage', label: 'I get hit', needsDetail: false, detailHint: '', symbol: 'heart.slash.fill' },
     { key: 'healthLow', label: 'my health gets low', needsDetail: false, detailHint: '', symbol: 'heart.fill' },
     { key: 'baddiesGone', label: 'all the baddies are gone', needsDetail: false, detailHint: '', symbol: 'bolt.fill' },
@@ -469,6 +470,8 @@ export const BehaviorVocabulary = {
   conditions: [
     { key: 'hasKey', label: 'the player has a key', needsDetail: false, detailHint: '', symbol: 'key.fill' },
     { key: 'playerClose', label: 'the player is close', needsDetail: false, detailHint: '', symbol: 'figure.stand' },
+    { key: 'isFlying', label: 'I am flying', needsDetail: false, detailHint: '', symbol: 'wind' },
+    { key: 'isGrounded', label: 'I am on the ground', needsDetail: false, detailHint: '', symbol: 'figure.stand' },
     { key: 'flagSet', label: 'something already happened', needsDetail: true, detailHint: 'found the sword', symbol: 'flag.fill' },
     { key: 'isBoss', label: 'this is a boss', needsDetail: false, detailHint: '', symbol: 'crown.fill' },
     { key: 'healthFull', label: 'the player is at full health', needsDetail: false, detailHint: '', symbol: 'heart.fill' },
@@ -477,8 +480,12 @@ export const BehaviorVocabulary = {
   actions: [
     { key: 'chase', label: 'chase the player', needsDetail: false, detailHint: '', symbol: 'figure.run' },
     { key: 'patrol', label: 'walk my patrol path', needsDetail: false, detailHint: '', symbol: 'arrow.triangle.2.circlepath' },
+    { key: 'flyPattern', label: 'fly a sky pattern', needsDetail: true, detailHint: 'figure8 / circle / swoop', symbol: 'wind' },
     { key: 'flee', label: 'run away', needsDetail: false, detailHint: '', symbol: 'arrow.left.circle.fill' },
-    { key: 'attack', label: 'attack', needsDetail: false, detailHint: '', symbol: 'flame.fill' },
+    { key: 'attack', label: 'attack (library action)', needsDetail: true, detailHint: 'fireBreath / groundPound / clawSlash', symbol: 'flame.fill' },
+    { key: 'randomAttack', label: 'pick primary or secondary attack', needsDetail: false, detailHint: '', symbol: 'sparkles' },
+    { key: 'landAndAttack', label: 'land and ground-slam', needsDetail: true, detailHint: 'groundPound', symbol: 'hammer.fill' },
+    { key: 'enrage', label: 'enrage (faster & fiercer)', needsDetail: false, detailHint: '', symbol: 'flame.fill' },
     { key: 'playAnimation', label: 'play an action', needsDetail: true, detailHint: 'dance', symbol: 'figure.dance' },
     { key: 'say', label: 'say something', needsDetail: true, detailHint: 'Welcome, traveller!', symbol: 'bubble.left.fill' },
     { key: 'playSound', label: 'play a sound', needsDetail: true, detailHint: 'coin chime', symbol: 'speaker.wave.2.fill' },
@@ -685,7 +692,9 @@ export const RecipeLibrary: RuleRecipe[] = [
   { id: 'trap', title: 'Hidden trap', symbol: 'exclamationmark.triangle.fill', blurb: 'Hurts whoever steps on it.', whenKey: 'playerTouches', conditionKeys: [], actionKeys: ['takeDamage', 'playSound'], kinds: ['trap'] },
   { id: 'plate', title: 'Plate opens door', symbol: 'square.grid.2x2.fill', blurb: 'Stand on it and a door opens.', whenKey: 'playerTouches', conditionKeys: [], actionKeys: ['setFlag', 'playSound'], kinds: ['puzzle'] },
   { id: 'checkpoint', title: 'Checkpoint', symbol: 'flag.fill', blurb: 'Remembers you were here.', whenKey: 'playerTouches', conditionKeys: [], actionKeys: ['setFlag', 'playSound', 'showMessage'], kinds: ['checkpoint'] },
-  { id: 'bossPhase', title: 'Boss second phase', symbol: 'crown.fill', blurb: 'Gets angry when health is low.', whenKey: 'healthLow', conditionKeys: ['isBoss'], actionKeys: ['say', 'shakeCamera', 'chase'], kinds: ['baddie'] },
+  { id: 'bossPhase', title: 'Boss second phase', symbol: 'crown.fill', blurb: 'Gets angry and fierce when health is low.', whenKey: 'healthLow', conditionKeys: ['isBoss'], actionKeys: ['say', 'enrage', 'shakeCamera'], kinds: ['baddie'] },
+  { id: 'airborneHunt', title: 'Sight hunt & breath', symbol: 'wind', blurb: 'Spots hero by sight/range, chases & uses random action.', whenKey: 'seesPlayer', conditionKeys: [], actionKeys: ['chase', 'randomAttack'], kinds: ['baddie'] },
+  { id: 'flyerLandingSmash', title: 'Land & ground-slam', symbol: 'hammer.fill', blurb: 'When flying close to hero, lands to slam the earth.', whenKey: 'playerNear', conditionKeys: ['isFlying'], actionKeys: ['landAndAttack'], kinds: ['baddie'] },
   { id: 'spawnWave', title: 'Summon a wave', symbol: 'plus.circle.fill', blurb: 'Calls for help when hurt.', whenKey: 'takesDamage', conditionKeys: [], actionKeys: ['spawn', 'say'], kinds: ['baddie', 'spawner'] },
 ];
 
@@ -1042,17 +1051,18 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
     magicEffect: 'Crisp melee arc; dependable against woodland foes.',
     meshKind: 'sword',
     toolKind: 'sword',
+    handedness: 'oneHand',
     attackBonus: 1,
     weaponRange: 2.8,
     metadata: {
       power: 12,
       durability: 100,
       maxDurability: 100,
-      magic_effect: 'Crisp melee arc; dependable against woodland foes.',
+      magic_effect: 'Crisp melee arc; pairs cleanly with a shield in your off-hand.',
       rarity: 'common',
       weight: 2.4,
       repairable: true,
-      properties: { damageType: 'Slashing', swingSpeed: 'Fast', alloy: 'River Iron' },
+      properties: { damageType: 'Slashing', handedness: '1-Handed', alloy: 'River Iron' },
     },
   },
   {
@@ -1065,6 +1075,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
     lore: 'Hickory-handled forester hatchet balanced for felling timber.',
     meshKind: 'axe',
     toolKind: 'axe',
+    handedness: 'twoHand',
     attackBonus: 1,
     weaponRange: 2.8,
     metadata: {
@@ -1075,7 +1086,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
       rarity: 'common',
       weight: 2.9,
       repairable: true,
-      properties: { harvestTarget: 'Forest Trees', handle: 'Seasoned Hickory' },
+      properties: { harvestTarget: 'Forest Trees', handedness: '2-Handed', handle: 'Seasoned Hickory' },
     },
   },
   {
@@ -1088,6 +1099,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
     lore: 'Supple cured bamboo fitted with a brass reel and red cork float.',
     meshKind: 'fishingPole',
     toolKind: 'fishingPole',
+    handedness: 'twoHand',
     metadata: {
       power: 6,
       durability: 80,
@@ -1096,7 +1108,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
       rarity: 'common',
       weight: 1.1,
       repairable: true,
-      properties: { lineLength: '4.5m', baitType: 'Red Cork Float' },
+      properties: { lineLength: '4.5m', handedness: '2-Handed', baitType: 'Red Cork Float' },
     },
   },
   {
@@ -1110,6 +1122,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
     magicEffect: 'Casts warm dynamic light around your hero in dark caverns.',
     meshKind: 'torch',
     toolKind: 'torch',
+    handedness: 'oneHand',
     metadata: {
       power: 7,
       durability: 60,
@@ -1119,7 +1132,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
       weight: 0.9,
       craftable: true,
       repairable: true,
-      properties: { lightRadius: '11m', fuel: 'Pine Resin' },
+      properties: { lightRadius: '11m', handedness: '1-Handed', fuel: 'Pine Resin' },
     },
   },
   {
@@ -1154,6 +1167,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
     lore: 'Dense oak heartwood bound with river stone counterweights.',
     meshKind: 'woodLog',
     toolKind: 'sword',
+    handedness: 'oneHand',
     attackBonus: 2,
     weaponRange: 2.6,
     metadata: {
@@ -1165,7 +1179,7 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
       weight: 4.1,
       craftable: true,
       repairable: true,
-      properties: { damageType: 'Crushing', knockback: 'High', core: 'Oak & Basalt' },
+      properties: { damageType: 'Crushing', handedness: '1-Handed', knockback: 'High', core: 'Oak & Basalt' },
     },
   },
   {
@@ -1525,6 +1539,60 @@ export const DefaultInventoryItems: InventoryItemDef[] = [
       properties: { slot: 'Royal Crown', blessing: 'Lantern Festival' },
     },
   },
+  {
+    id: 'oak_shield',
+    name: 'Woodland Oak Shield',
+    category: 'wearable',
+    colorHex: '#B47634',
+    icon: 'shield',
+    description:
+      'Sturdy iron-rimmed oak shield carried in your off-hand alongside a 1-handed weapon. Press Use (E / Alt) when attacked to raise your shield and absorb incoming blows.',
+    lore: 'Seasoned heartwood plank braced with riveted brass bands and a central iron boss.',
+    magicEffect: 'Reduces blocked incoming damage by 65% and prevents knockdown stun while guarding.',
+    meshKind: 'shield',
+    wearSlot: 'offhand',
+    wearColorHex: '#B47634',
+    defenseBonus: 1,
+    blockReduction: 0.65,
+    metadata: {
+      power: 14,
+      durability: 120,
+      maxDurability: 120,
+      magic_effect: 'Raise with Use (E) to block 65% of incoming strike damage and brace against knockdowns.',
+      rarity: 'common',
+      weight: 2.8,
+      craftable: true,
+      repairable: true,
+      properties: { slot: 'Off-Hand Shield', blockReduce: '65%', pairsWith: '1-Handed Weapons' },
+    },
+  },
+  {
+    id: 'iron_kite_shield',
+    name: 'Iron Kite Shield',
+    category: 'wearable',
+    colorHex: '#94A3B8',
+    icon: 'shield',
+    description:
+      'Reinforced steel kite shield for boss battles. Press Use (E / Alt) to raise it in front of you and blunt ferocious elemental and claw attacks.',
+    lore: 'Tempered dragon-warding iron shield crested with an ember sigil.',
+    magicEffect: 'Reduces blocked incoming damage by 80% and halves elemental burn/shock/freeze buildup.',
+    meshKind: 'shield',
+    wearSlot: 'offhand',
+    wearColorHex: '#94A3B8',
+    defenseBonus: 2,
+    blockReduction: 0.8,
+    metadata: {
+      power: 22,
+      durability: 180,
+      maxDurability: 180,
+      magic_effect: 'Raise with Use (E) to absorb 80% of strike damage and halve elemental status duration.',
+      rarity: 'rare',
+      weight: 4.0,
+      craftable: true,
+      repairable: true,
+      properties: { slot: 'Off-Hand Shield', blockReduce: '80%', pairsWith: '1-Handed Weapons' },
+    },
+  },
 ];
 
 export interface ResolvedItemMetadata {
@@ -1692,6 +1760,24 @@ export const DefaultCraftingRecipes: CraftingRecipe[] = [
     ingredientA: 'forest_herbs',
     ingredientB: 'cave_moss',
     resultItemId: 'leaf_cloak',
+    resultQty: 1,
+    category: 'wearable',
+  },
+  {
+    id: 'recipe_oak_shield',
+    title: 'Woodland Oak Shield',
+    ingredientA: 'wood_log',
+    ingredientB: 'ancient_bone',
+    resultItemId: 'oak_shield',
+    resultQty: 1,
+    category: 'wearable',
+  },
+  {
+    id: 'recipe_kite_shield',
+    title: 'Iron Kite Shield',
+    ingredientA: 'oak_shield',
+    ingredientB: 'river_stone',
+    resultItemId: 'iron_kite_shield',
     resultQty: 1,
     category: 'wearable',
   },
@@ -1934,16 +2020,27 @@ function makeCard(
   whenKey: string,
   actionKeys: string[],
   detail = '',
-  conditionKeys: string[] = []
+  conditionKeys: string[] = [],
+  whenDetail = ''
 ): BehaviorCard {
   return {
     id: uid(),
-    when: { id: uid(), key: whenKey, detail: '' },
+    when: { id: uid(), key: whenKey, detail: whenDetail },
     conditions: conditionKeys.map((k) => ({ id: uid(), key: k, detail: '' })),
     actions: actionKeys.map((k) => ({
       id: uid(),
       key: k,
-      detail: k === 'say' || k === 'giveTreasure' || k === 'playAnimation' || k === 'showMessage' || k === 'setFlag' ? detail : '',
+      detail:
+        k === 'say' ||
+        k === 'giveTreasure' ||
+        k === 'playAnimation' ||
+        k === 'showMessage' ||
+        k === 'setFlag' ||
+        k === 'attack' ||
+        k === 'flyPattern' ||
+        k === 'landAndAttack'
+          ? detail
+          : '',
     })),
     isOnce: false,
     isEnabled: true,
@@ -2164,6 +2261,32 @@ function buildThemedProject(
         createEntity('scenery', 'Bush', 0.82, 0.6),
         ...(environmentType === 'openWorld' && idx === 0 ? createStarterOpenWorldPickups() : []),
       ];
+      if (name === 'Island Explorer' && idx === 0) {
+        const drakeBp = createShowcaseTwinFlameDrakeBlueprint();
+        level.entities.push(
+          createEntity('baddie', 'Twin-Flame Drake', 0.35, 0.62, {
+            isBoss: true,
+            brain: 'Boss',
+            health: drakeBp.health ?? 18,
+            speed: drakeBp.speed ?? 4,
+            damage: 2,
+            scale: 1.3,
+            monsterConfig: drakeBp,
+            baddieAI: drakeBp.baddieAI,
+            dialogue: 'Twice the jaws, twice the fire!',
+            cards: [
+              makeCard('seesPlayer', ['chase', 'randomAttack'], '', [], '26m'),
+              makeCard('playerNear', ['landAndAttack'], 'groundPound', ['isFlying'], '5m'),
+              makeCard('healthLow', ['say', 'enrage', 'shakeCamera'], 'Now feel our twin inferno!', ['isBoss']),
+            ],
+          })
+        );
+        level.objectives.unshift({
+          id: uid(),
+          text: 'Defeat the Twin-Flame Drake boss',
+          isOptional: false,
+        });
+      }
       if (idx > 0) {
         level.entities.push(createEntity('key', 'Old key', 0.3, 0.3));
         level.objectives.push({ id: uid(), text: 'Find the old key', isOptional: true });

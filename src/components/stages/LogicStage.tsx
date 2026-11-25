@@ -6,6 +6,7 @@ import {
   RecipeLibrary,
   ruleSentence,
 } from '../../data/registries';
+import { BADDIE_ACTION_LIBRARY, FLIGHT_PATTERN_OPTIONS } from '../../data/baddieActionLibrary';
 import type { MakerStore } from '../../store/useMakerStore';
 import type { BehaviorCard, LevelEntity } from '../../types/maker';
 import { uid } from '../../utils/terrain';
@@ -471,11 +472,18 @@ const RuleCardEditor: React.FC<{
                     </option>
                   ))}
                 </select>
-                {def?.needsDetail && (
+                  {def?.needsDetail && (
                   <input
                     type="text"
                     value={act.detail}
                     placeholder={def.detailHint}
+                    list={
+                      act.key === 'attack' || act.key === 'landAndAttack'
+                        ? 'baddie-action-library-list'
+                        : act.key === 'flyPattern'
+                          ? 'baddie-flight-pattern-list'
+                          : undefined
+                    }
                     onChange={(e) =>
                       updateCard(
                         (c) => ({
@@ -507,6 +515,20 @@ const RuleCardEditor: React.FC<{
           })}
         </div>
       </div>
+      <datalist id="baddie-action-library-list">
+        {BADDIE_ACTION_LIBRARY.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.label} ({a.heroEffect})
+          </option>
+        ))}
+      </datalist>
+      <datalist id="baddie-flight-pattern-list">
+        {FLIGHT_PATTERN_OPTIONS.map((f) => (
+          <option key={f.id} value={f.id}>
+            {f.label}
+          </option>
+        ))}
+      </datalist>
     </MakerCard>
   );
 };

@@ -479,6 +479,26 @@ export class MonsterAttackVfxController {
   }
 
   /**
+   * Pulses a locked ground telegraph ring at the target location during windup
+   * so players clearly see the committed attack zone and can dodge out of it.
+   */
+  public emitLockedTelegraph(
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+    colorHex: string,
+    progress: number
+  ) {
+    // Emit a subtle rhythmic ring pulse ~every 0.18s without exhausting the pool
+    if (Math.random() > 0.24 && progress > 0.08) return;
+    _origin.set(x, y + 0.08, z);
+    const targetScale = Math.max(1.2, radius * 1.45);
+    const startScale = targetScale * (0.45 + 0.35 * Math.min(1, progress));
+    this.spawnRing(_origin, colorHex, 0.32, startScale, targetScale);
+  }
+
+  /**
    * Emits continuous charge-up orbs during windup or active elemental/shockwave VFX during strike.
    */
   public emitAttackStep(

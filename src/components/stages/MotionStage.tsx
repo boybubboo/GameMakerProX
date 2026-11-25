@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Bone,
   Bookmark,
   Box,
   Camera,
   Check,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   CircleDot,
@@ -14,6 +16,7 @@ import {
   Film,
   FlipHorizontal2,
   Ghost,
+  GitCompare,
   KeyRound,
   Layers,
   Lock,
@@ -24,12 +27,16 @@ import {
   Repeat,
   RotateCcw,
   Save,
+  Shield,
   SlidersHorizontal,
   Sparkles,
   Star,
+  Sword,
+  Target,
   Trash2,
   Unlock,
   Upload,
+  Wand2,
   Zap,
 } from 'lucide-react';
 import { ActionsStage } from './ActionsStage';
@@ -46,6 +53,17 @@ import {
   sampleMotionPresetToPose,
   type RigTestOverride,
 } from '../../three/proceduralRigAnimator';
+import {
+  autoBlendLoopSeam,
+  autoFitPresetTiming,
+  clampPresetToNaturalRange,
+  describeTargetKey,
+  evaluateMotionSafety,
+  listStudioActors,
+  resolveStudioCustomAnimationsAndDefaults,
+  type StudioActorDescriptor,
+  type StudioContextPropsState,
+} from '../../three/universalMotionAdapter';
 import type {
   BonePoseAngles,
   CustomAssetMeta,
@@ -53,7 +71,9 @@ import type {
   CustomMotionPreset,
   CustomPoseKeyframe,
   CustomRigSettings,
+  MotionActorCategory,
   MotionEasing,
+  MotionRigArchetype,
   RigAnimationMode,
   SavedPosePreset,
   SlotMotionTuning,
@@ -69,6 +89,7 @@ import {
   mirrorPoseBones,
   type MirrorPoseMode,
 } from '../shared/MotionEditorPanel';
+import { MotionAssignModal } from '../shared/MotionAssignModal';
 import {
   RigPreviewStage,
   type GizmoAxisFilter,
@@ -78,6 +99,8 @@ import {
 import { SavedPosesSidebar } from '../shared/SavedPosesSidebar';
 import {
   buildStandardMotionPresetTemplate,
+  getSlotsForActorCategory,
+  MOTION_SLOT_META_BY_SLOT,
   STANDARD_MOTION_SLOTS,
 } from '../../data/motionLibrary';
 
@@ -87,7 +110,7 @@ const GIZMO_SIZE_MAP: Record<'M' | 'L' | 'XL', number> = {
   XL: 1.95,
 };
 
-const SLOT_OPTIONS: { slot: CustomClipSlot; label: string; short: string; group: 'core' | 'object' | 'character' }[] =
+const SLOT_OPTIONS: { slot: CustomClipSlot; label: string; short: string; group: 'core' | 'object' | 'character' | 'combat' }[] =
   STANDARD_MOTION_SLOTS.map((s) => ({
     slot: s.slot,
     label: s.label,
@@ -103,6 +126,14 @@ const SLOT_OPTIONS: { slot: CustomClipSlot; label: string; short: string; group:
         : s.label.replace(/ \(.*\)$/, ''),
     group: s.group,
   }));
+
+const CATEGORY_TABS: { id: MotionActorCategory | 'all'; label: string }[] = [
+  { id: 'all', label: 'All Cast' },
+  { id: 'hero', label: 'Hero' },
+  { id: 'npc', label: 'NPCs' },
+  { id: 'buddy', label: 'Buddies' },
+  { id: 'enemy', label: 'Enemies & Bosses' },
+];
 
 function createBlankMotionDraft(slot: CustomClipSlot): CustomMotionPreset {
   const slotTitle = SLOT_OPTIONS.find((s) => s.slot === slot)?.short ?? 'Move';
@@ -127,45 +158,114 @@ function createBlankMotionDraft(slot: CustomClipSlot): CustomMotionPreset {
 }
 
 export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
-  // Prioritize hero's custom asset, then motionAssetId, then first rigged asset
-  const riggedAssets = useMemo(() => {
-    const chars = store.customAssets.filter(
-      (a) => a.hasSkeleton || (a.boneNames && a.boneNames.length > 0) || a.category === 'character'
-    );
-    return chars.length > 0 ? chars : store.customAssets;
-  }, [store.customAssets]);
+  // Universal Cast & Monster List (Built-in Hero, NPCs, Buddies, Monsters/Dragons, and uploaded GLBs)
+  const studioActors = useMemo(
+    () => listStudioActors(store.currentProject, store.currentLevel, store.customAssets),
+    [store.currentProject, store.currentLevel, store.customAssets]
+  );
 
-  const defaultSelectedId = useMemo(() => {
-    if (store.motionAssetId && store.customAssets.some((a) => a.id === store.motionAssetId)) {
-      return store.motionAssetId;
+  const [categoryFilter, setCategoryFilter] = useState<MotionActorCategory | 'all'>('all');
+  const [selectedActorId, setSelectedActorId] = useState<string>(() => {
+    if (store.motionActorTarget) {
+      const k = describeTargetKey(store.motionActorTarget);
+      const found = studioActors.find((a) => describeTargetKey(a.target) === k);
+      if (found) return found.id;
     }
-    const heroId = store.currentProject?.heroCustomAssetId;
-    if (heroId && store.customAssets.some((a) => a.id === heroId)) {
-      return heroId;
+    if (store.motionAssetId) {
+      const found = studioActors.find(
+        (a) => a.target.kind === 'customAsset' && a.target.assetId === store.motionAssetId
+      );
+      if (found) return found.id;
     }
-    return riggedAssets[0]?.id ?? null;
-  }, [store.motionAssetId, store.customAssets, store.currentProject?.heroCustomAssetId, riggedAssets]);
+    return studioActors[0]?.id ?? 'builtInHero';
+  });
 
-  const [selectedAssetId, setSelectedAssetId] = useState<string | null>(defaultSelectedId);
-
-  // Sync if user jumped here from Asset Vault targeting a specific asset
+  // Sync if user jumped here from Cast / HeroInspector / Monster Maker / Asset Vault
   useEffect(() => {
-    if (store.motionAssetId && store.customAssets.some((a) => a.id === store.motionAssetId)) {
-      setSelectedAssetId(store.motionAssetId);
-    } else if (!selectedAssetId && defaultSelectedId) {
-      setSelectedAssetId(defaultSelectedId);
+    if (store.motionActorTarget) {
+      const k = describeTargetKey(store.motionActorTarget);
+      const match = studioActors.find((a) => describeTargetKey(a.target) === k);
+      if (match) {
+        setSelectedActorId(match.id);
+        setCategoryFilter(match.category);
+      } else {
+        setSelectedActorId(k);
+        setCategoryFilter(store.motionActorTarget.category);
+      }
+      return;
     }
-  }, [store.motionAssetId, store.customAssets, selectedAssetId, defaultSelectedId]);
+    if (store.motionAssetId) {
+      const match = studioActors.find(
+        (a) => a.target.kind === 'customAsset' && a.target.assetId === store.motionAssetId
+      );
+      if (match) {
+        setSelectedActorId(match.id);
+      }
+    }
+  }, [store.motionActorTarget, store.motionAssetId, studioActors]);
+
+  const filteredActors = useMemo(
+    () =>
+      categoryFilter === 'all'
+        ? studioActors
+        : studioActors.filter((a) => a.category === categoryFilter),
+    [studioActors, categoryFilter]
+  );
+
+  const selectedActor: StudioActorDescriptor = useMemo(() => {
+    const exact = studioActors.find((a) => a.id === selectedActorId);
+    if (exact) return exact;
+    if (store.motionActorTarget) {
+      return {
+        id: describeTargetKey(store.motionActorTarget),
+        label: store.motionActorTarget.label,
+        subtitle: '',
+        category: store.motionActorTarget.category,
+        archetype:
+          store.motionActorTarget.kind === 'monsterBlueprint'
+            ? 'quadruped'
+            : store.motionActorTarget.kind === 'buddyCritter'
+            ? 'critter'
+            : store.motionActorTarget.kind === 'proceduralBaddie'
+            ? 'baddie'
+            : 'humanoid',
+        target: store.motionActorTarget,
+        entityId: 'entityId' in store.motionActorTarget ? store.motionActorTarget.entityId : undefined,
+      };
+    }
+    return filteredActors[0] ?? studioActors[0];
+  }, [selectedActorId, studioActors, filteredActors, store.motionActorTarget]);
 
   const selectedAsset: CustomAssetMeta | null = useMemo(() => {
-    if (!selectedAssetId) return riggedAssets[0] ?? null;
-    return store.customAssets.find((a) => a.id === selectedAssetId) ?? riggedAssets[0] ?? null;
-  }, [selectedAssetId, store.customAssets, riggedAssets]);
+    if (selectedActor?.target.kind === 'customAsset') {
+      const targetAssetId = selectedActor.target.assetId;
+      return store.customAssets.find((a) => a.id === targetAssetId) ?? null;
+    }
+    return null;
+  }, [selectedActor, store.customAssets]);
+
+  const [runtimeInfo, setRuntimeInfo] = useState<{
+    boneNames: string[];
+    rigSettings: CustomRigSettings;
+    archetype: MotionRigArchetype;
+    hipsHeightRef: number;
+    hasTelegraph: boolean;
+    hasHeroProps: boolean;
+  } | null>(null);
 
   const [cachedInfo, setCachedInfo] = useState<CachedGLTF | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadErr, setUploadErr] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Context Props & Compare Original (A/B) state
+  const [contextProps, setContextProps] = useState<StudioContextPropsState>({
+    weapon: 'sword',
+    shield: true,
+    showTelegraph: false,
+  });
+  const [compareOriginal, setCompareOriginal] = useState(false);
+  const [assignModalOpen, setAssignModalOpen] = useState(false);
 
   // Viewport display state
   const [cameraPreset, setCameraPreset] = useState<StageCameraPreset>('threeQuarter');
@@ -202,7 +302,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     bones: Record<string, BonePoseAngles>;
     hipsY: number;
   } | null>(null);
-  const [leftSidebarTab, setLeftSidebarTab] = useState<'poses' | 'library'>('poses');
+  const [leftSidebarTab, setLeftSidebarTab] = useState<'poses' | 'library'>('library');
   const [activeSavedPoseId, setActiveSavedPoseId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -217,7 +317,27 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     window.setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 2200);
   }, []);
 
-  // Load parsed GLTF info & initialize draft when switching characters
+  const resolvedActorLibrary = useMemo(
+    () =>
+      selectedActor
+        ? resolveStudioCustomAnimationsAndDefaults(
+            selectedActor.target,
+            store.currentProject,
+            store.currentLevel,
+            store.customAssets
+          )
+        : { customAnimations: [], defaultSlotPresets: {} },
+    [selectedActor, store.currentProject, store.currentLevel, store.customAssets]
+  );
+
+  // If actor is procedural (not GLB), Base Gait falls back to Keyframe Pose automatically
+  useEffect(() => {
+    if (!selectedAsset && studioMode === 'gait') {
+      setStudioMode('pose');
+    }
+  }, [selectedAsset, studioMode, setStudioMode]);
+
+  // Load GLB cache when selectedAsset changes
   useEffect(() => {
     if (!selectedAsset) {
       setCachedInfo(null);
@@ -233,44 +353,80 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         if (!cancelled) setCachedInfo(loaded);
       });
     }
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedAsset?.id, selectedAsset?.category]);
 
+  // Reset editor draft when switching between ANY Studio Actor
+  const activeActorKey = selectedActor?.id ?? 'none';
+  useEffect(() => {
+    if (!selectedActor) return;
     setIsPlaying(false);
+    setCompareOriginal(false);
     setGaitPaused(false);
     setGaitDirty(false);
     setPlayhead(0);
     setIsDirtyPose(false);
     setActiveSavedPoseId(null);
-    const existing = selectedAsset.customAnimations?.[0];
-    if (existing) {
-      const cloned: CustomMotionPreset = JSON.parse(JSON.stringify(existing));
+
+    const requestedSlot = store.motionRequestedSlot;
+    const savedForActor = resolvedActorLibrary.customAnimations;
+    const initialSlot: CustomClipSlot =
+      requestedSlot ??
+      (selectedActor.category === 'enemy'
+        ? selectedActor.archetype === 'quadruped'
+          ? 'dying'
+          : 'attack'
+        : selectedActor.category === 'buddy'
+        ? 'cheer'
+        : selectedActor.category === 'npc'
+        ? 'talk'
+        : 'block');
+
+    const defaultId = resolvedActorLibrary.defaultSlotPresets[initialSlot];
+    const matchingSaved =
+      (defaultId ? savedForActor.find((p) => p.id === defaultId) : undefined) ??
+      savedForActor.find((p) => p.slot === initialSlot);
+
+    if (matchingSaved) {
+      const cloned: CustomMotionPreset = JSON.parse(JSON.stringify(matchingSaved));
       setDraft(cloned);
       setSavedPresetId(cloned.id);
       const startSample = sampleMotionPresetToPose(cloned, 0);
       setWorkingBones(startSample.bones);
       setWorkingHipsY(startSample.hipsOffsetY);
     } else {
-      const fresh = createBlankMotionDraft('walk');
-      setDraft(fresh);
+      const template = buildStandardMotionPresetTemplate(initialSlot, {}, {
+        rigArchetype: selectedActor.archetype,
+        actorCategory: selectedActor.category,
+        hipsHeightRef: runtimeInfo?.hipsHeightRef,
+      });
+      setDraft(template);
       setSavedPresetId(null);
-      setWorkingBones({});
-      setWorkingHipsY(0);
+      const startSample = sampleMotionPresetToPose(template, 0);
+      setWorkingBones(startSample.bones);
+      setWorkingHipsY(startSample.hipsOffsetY);
     }
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedAsset?.id, selectedAsset?.category]);
+  }, [activeActorKey]);
 
   const boneNames = useMemo(() => {
+    if (runtimeInfo?.boneNames.length) return runtimeInfo.boneNames;
     if (cachedInfo?.skeletonInfo.boneNames.length) return cachedInfo.skeletonInfo.boneNames;
     return selectedAsset?.boneNames ?? [];
-  }, [cachedInfo, selectedAsset]);
+  }, [runtimeInfo, cachedInfo, selectedAsset]);
+
+  const activeArchetype: MotionRigArchetype =
+    runtimeInfo?.archetype ?? selectedActor?.archetype ?? 'humanoid';
 
   const effectiveRig: CustomRigSettings | null = useMemo(() => {
-    if (!selectedAsset) return null;
-    if (cachedInfo) return resolveRigSettings(cachedInfo, selectedAsset);
-    if (selectedAsset.rigSettings) return selectedAsset.rigSettings;
+    if (selectedAsset) {
+      if (cachedInfo) return resolveRigSettings(cachedInfo, selectedAsset);
+      if (selectedAsset.rigSettings) return selectedAsset.rigSettings;
+    }
+    if (runtimeInfo?.rigSettings) return runtimeInfo.rigSettings;
     return {
-      mode: selectedAsset.animationClips.length > 0 ? 'auto' : 'procedural',
+      mode: 'procedural',
       boneMap: {},
       limbSwingAxis: 'auto',
       armRelaxAngle: 0,
@@ -282,7 +438,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
       headMotion: 1,
       facingOffsetDeg: 0,
     };
-  }, [cachedInfo, selectedAsset]);
+  }, [selectedAsset, cachedInfo, runtimeInfo]);
 
   useEffect(() => {
     if (!effectiveRig) {
@@ -296,7 +452,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         slotTuning: effectiveRig.slotTuning ? { ...effectiveRig.slotTuning } : undefined,
       });
     }
-  }, [effectiveRig, selectedAsset?.id, gaitDirty]);
+  }, [effectiveRig, activeActorKey, gaitDirty]);
 
   const stageRig: CustomRigSettings | null =
     studioMode === 'gait' && gaitRigDraft ? gaitRigDraft : effectiveRig;
@@ -319,10 +475,11 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     };
   }, [selectedAsset, studioMode, draft.slot]);
 
-  // Keep a valid bone selected
+  // Keep a valid bone selected whenever actor or bone list changes
   useEffect(() => {
     if (boneNames.length > 0 && (!selectedBone || !boneNames.includes(selectedBone))) {
       const preferred =
+        boneNames.find((b) => b === 'MonsterHead_0') ??
         effectiveRig?.boneMap.rightUpperArm ??
         effectiveRig?.boneMap.head ??
         boneNames[0];
@@ -335,14 +492,17 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     [boneNames, effectiveRig]
   );
 
-  // Organize silhouette body-map groups cleanly (Left Arm, Center Core, Right Arm, Left Leg, Right Leg)
+  // Organize silhouette body-map groups cleanly
   const bodySilhouette = useMemo(() => {
     const core = quickJoints.filter((q) => q.group === 'core');
     const leftArm = quickJoints.filter((q) => q.group === 'arms' && q.label.startsWith('L '));
     const rightArm = quickJoints.filter((q) => q.group === 'arms' && q.label.startsWith('R '));
     const leftLeg = quickJoints.filter((q) => q.group === 'legs' && q.label.startsWith('L '));
     const rightLeg = quickJoints.filter((q) => q.group === 'legs' && q.label.startsWith('R '));
-    return { core, leftArm, rightArm, leftLeg, rightLeg };
+    const leftWing = quickJoints.filter((q) => q.group === 'wings' && q.label.startsWith('L '));
+    const rightWing = quickJoints.filter((q) => q.group === 'wings' && q.label.startsWith('R '));
+    const tail = quickJoints.filter((q) => q.group === 'tail');
+    return { core, leftArm, rightArm, leftLeg, rightLeg, leftWing, rightWing, tail };
   }, [quickJoints]);
 
   const sortedKeyframes = useMemo(
@@ -360,9 +520,33 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     [draft, effectiveRig]
   );
 
+  const fitReport = useMemo(
+    () => evaluateMotionSafety(draft, boneNames, activeArchetype),
+    [draft, boneNames, activeArchetype]
+  );
+
+  const builtInOriginalPreset = useMemo(() => {
+    if (!compareOriginal || !selectedActor) return null;
+    const origSlot = (draft.sourcePresetId as CustomClipSlot | undefined) ?? draft.slot;
+    return buildStandardMotionPresetTemplate(origSlot, effectiveRig?.boneMap ?? {}, {
+      rigArchetype: activeArchetype,
+      actorCategory: selectedActor.category,
+      availableBoneNames: boneNames,
+      hipsHeightRef: runtimeInfo?.hipsHeightRef,
+    });
+  }, [compareOriginal, selectedActor, draft.sourcePresetId, draft.slot, effectiveRig, activeArchetype, boneNames, runtimeInfo?.hipsHeightRef]);
+
   const effectiveTestOverride: RigTestOverride = useMemo(() => {
     if (boneNames.length === 0) return null;
     if (studioMode === 'gait') return null;
+    if (compareOriginal && builtInOriginalPreset) {
+      return {
+        kind: 'presetPreview',
+        preset: builtInOriginalPreset,
+        timeNorm: playhead,
+        playing: isPlaying,
+      };
+    }
     if (isPlaying && draft.keyframes.length >= 2) {
       return {
         kind: 'presetPreview',
@@ -376,7 +560,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
       bones: workingBones,
       hipsOffsetY: workingHipsY,
     };
-  }, [boneNames.length, studioMode, isPlaying, draft, playhead, workingBones, workingHipsY]);
+  }, [boneNames.length, studioMode, compareOriginal, builtInOriginalPreset, isPlaying, draft, playhead, workingBones, workingHipsY]);
 
   const ghostStartPose = useMemo(() => {
     if (!showLoopGhost || !draft.loop || draft.keyframes.length === 0) return null;
@@ -706,51 +890,43 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
       ...draft,
       id: presetId,
       name: name.trim() || draft.name.trim() || `Custom ${draft.slot}`,
+      actorCategory: selectedActor?.category ?? draft.actorCategory,
+      rigArchetype: activeArchetype,
+      hipsHeightRef: runtimeInfo?.hipsHeightRef ?? draft.hipsHeightRef,
       keyframes: keys,
       updatedAt: new Date().toISOString(),
     };
   };
 
   const handleSaveOverwrite = () => {
-    if (!selectedAsset || !savedPresetId) return;
+    if (!selectedActor || !savedPresetId) return;
     const finalized = buildFinalizedDraft(savedPresetId, draft.name);
-    const list = selectedAsset.customAnimations ?? [];
-    const exists = list.some((p) => p.id === savedPresetId);
-    const nextList = exists
-      ? list.map((p) => (p.id === savedPresetId ? finalized : p))
-      : [...list, finalized];
     setDraft(finalized);
     setIsDirtyPose(false);
-    void store.updateCustomAssetMeta({
-      ...selectedAsset,
-      customAnimations: nextList,
-    });
+    void store.saveUniversalMotionPreset(finalized, selectedActor.target, selectedAsset ?? undefined);
     flashToast(`Saved "${finalized.name}"`);
   };
 
   const handleSaveAsNew = () => {
-    if (!selectedAsset) return;
+    if (!selectedActor) return;
     const newId = uid();
     const baseName = draft.name.trim() || `Custom ${draft.slot}`;
-    const existingNames = new Set((selectedAsset.customAnimations ?? []).map((p) => p.name));
+    const existingNames = new Set(resolvedActorLibrary.customAnimations.map((p) => p.name));
     const uniqueName =
       savedPresetId && existingNames.has(baseName) ? `${baseName} Copy` : baseName;
     const finalized = buildFinalizedDraft(newId, uniqueName);
-    const nextList = [...(selectedAsset.customAnimations ?? []), finalized];
     setDraft(finalized);
     setSavedPresetId(newId);
     setIsDirtyPose(false);
-    void store.updateCustomAssetMeta({
-      ...selectedAsset,
-      customAnimations: nextList,
-    });
-    flashToast(`Saved new preset "${finalized.name}"`);
+    void store.saveUniversalMotionPreset(finalized, selectedActor.target, selectedAsset ?? undefined);
+    flashToast(`Saved variation "${finalized.name}"`);
   };
 
   const handleLoadPreset = (preset: CustomMotionPreset) => {
     const cloned: CustomMotionPreset = JSON.parse(JSON.stringify(preset));
     setStudioMode('pose');
     setIsPlaying(false);
+    setCompareOriginal(false);
     setDraft(cloned);
     setSavedPresetId(cloned.id);
     setPlayhead(0);
@@ -760,23 +936,30 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
     setIsDirtyPose(false);
   };
 
-  const handleCreateNewDraft = (slot: CustomClipSlot) => {
+  const handleRevealPremadeSlot = (slot: CustomClipSlot, autoPlay = false) => {
     const boneMap = stageRig?.boneMap ?? effectiveRig?.boneMap ?? {};
-    const fresh =
-      slot === 'walk' || slot === 'run' || slot === 'idle' || slot === 'jump' || slot === 'swim'
-        ? createBlankMotionDraft(slot)
-        : Object.keys(boneMap).length > 0
-        ? buildStandardMotionPresetTemplate(slot, boneMap)
-        : createBlankMotionDraft(slot);
+    const template = buildStandardMotionPresetTemplate(slot, boneMap, {
+      rigArchetype: activeArchetype,
+      actorCategory: selectedActor?.category,
+      availableBoneNames: boneNames,
+      hipsHeightRef: runtimeInfo?.hipsHeightRef,
+    });
     setStudioMode('pose');
-    setIsPlaying(false);
-    setDraft(fresh);
+    setCompareOriginal(false);
+    setDraft(template);
     setSavedPresetId(null);
     setPlayhead(0);
-    const startPose = fresh.keyframes[0];
-    setWorkingBones(startPose?.bones ? JSON.parse(JSON.stringify(startPose.bones)) : {});
-    setWorkingHipsY(startPose?.hipsOffsetY ?? 0);
+    const startSample = sampleMotionPresetToPose(template, 0);
+    setWorkingBones(startSample.bones);
+    setWorkingHipsY(startSample.hipsOffsetY);
     setIsDirtyPose(false);
+    setIsPlaying(autoPlay && template.keyframes.length >= 2);
+    const metaLabel = MOTION_SLOT_META_BY_SLOT[slot]?.label ?? slot;
+    flashToast(`Loaded built-in "${metaLabel}" (${template.keyframes.length} keys)`);
+  };
+
+  const handleCreateNewDraft = (slot: CustomClipSlot) => {
+    handleRevealPremadeSlot(slot, false);
   };
 
   const updateSlotTuning = useCallback(
@@ -854,43 +1037,76 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
   }, [stageRig, draft.slot, flashToast]);
 
   const handleDeletePreset = (presetId: string) => {
-    if (!selectedAsset) return;
-    const nextList = (selectedAsset.customAnimations ?? []).filter((p) => p.id !== presetId);
-    const nextDefaults = { ...(selectedAsset.defaultSlotPresets ?? {}) };
-    (Object.keys(nextDefaults) as CustomClipSlot[]).forEach((slot) => {
-      if (nextDefaults[slot] === presetId) {
-        delete nextDefaults[slot];
-      }
-    });
+    if (!selectedActor) return;
     if (savedPresetId === presetId) {
       setSavedPresetId(null);
     }
-    void store.updateCustomAssetMeta({
-      ...selectedAsset,
-      customAnimations: nextList,
-      defaultSlotPresets: nextDefaults,
-    });
+    void store.deleteUniversalMotionPreset(presetId, selectedActor.target, selectedAsset ?? undefined);
+    flashToast('Deleted saved variation');
   };
 
   const handleSetDefaultForSlot = (slot: CustomClipSlot, presetId: string | null) => {
-    if (!selectedAsset) return;
-    const nextDefaults = { ...(selectedAsset.defaultSlotPresets ?? {}) };
+    if (!selectedActor) return;
     if (presetId) {
-      nextDefaults[slot] = presetId;
+      const targetPreset =
+        resolvedActorLibrary.customAnimations.find((p) => p.id === presetId) ??
+        buildFinalizedDraft(presetId, draft.name);
+      const scope =
+        selectedActor.target.kind === 'builtInHero'
+          ? 'heroDefault'
+          : selectedActor.target.kind === 'proceduralNpc'
+          ? selectedActor.entityId
+            ? 'entityOverride'
+            : 'npcDefault'
+          : selectedActor.target.kind === 'buddyCritter'
+          ? selectedActor.entityId
+            ? 'entityOverride'
+            : 'buddyDefault'
+          : selectedActor.target.kind === 'monsterBlueprint'
+          ? 'monsterBlueprint'
+          : selectedActor.target.kind === 'proceduralBaddie'
+          ? selectedActor.entityId
+            ? 'entityOverride'
+            : 'baddieDefault'
+          : 'customAsset';
+      void store.assignMotionPresetToScope({
+        preset: targetPreset,
+        slot,
+        scope,
+        target: selectedActor.target,
+        entityId: selectedActor.entityId,
+        blueprint: resolvedActorLibrary.monsterBlueprint,
+        customAssetMeta: selectedAsset ?? undefined,
+      });
     } else {
-      delete nextDefaults[slot];
+      const scope =
+        selectedActor.target.kind === 'builtInHero'
+          ? 'heroDefault'
+          : selectedActor.target.kind === 'proceduralNpc'
+          ? selectedActor.entityId
+            ? 'entityOverride'
+            : 'npcDefault'
+          : selectedActor.target.kind === 'buddyCritter'
+          ? selectedActor.entityId
+            ? 'entityOverride'
+            : 'buddyDefault'
+          : selectedActor.target.kind === 'monsterBlueprint'
+          ? 'monsterBlueprint'
+          : selectedActor.target.kind === 'proceduralBaddie'
+          ? selectedActor.entityId
+            ? 'entityOverride'
+            : 'baddieDefault'
+          : 'customAsset';
+      void store.restoreDefaultMotionSlot({
+        slot,
+        scope,
+        target: selectedActor.target,
+        entityId: selectedActor.entityId,
+        customAssetMeta: selectedAsset ?? undefined,
+      });
     }
-    const nextRig =
-      presetId && effectiveRig?.mode === 'clips'
-        ? { ...effectiveRig, mode: 'auto' as RigAnimationMode }
-        : effectiveRig ?? undefined;
-    void store.updateCustomAssetMeta({
-      ...selectedAsset,
-      defaultSlotPresets: nextDefaults,
-      rigSettings: nextRig,
-    });
     const slotLabel = SLOT_OPTIONS.find((s) => s.slot === slot)?.short ?? slot;
-    flashToast(presetId ? `Set as default ${slotLabel} move` : `Reverted ${slotLabel} to built-in`);
+    flashToast(presetId ? `Assigned default ${slotLabel}` : `Restored built-in ${slotLabel}`);
   };
 
   const handleUploadGlb = async (files: FileList | null) => {
@@ -903,7 +1119,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         throw new Error(`"${file.name}" is not a .glb or .gltf file.`);
       }
       const meta = await store.uploadCustomGlb(file, 'character');
-      setSelectedAssetId(meta.id);
+      setSelectedActorId(`customAsset:${meta.id}`);
       store.setMotionAssetId(meta.id);
       flashToast(`Imported "${meta.name}"`);
     } catch (err) {
@@ -935,10 +1151,20 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
       ? getFriendlyBoneLabel(selectedBone, effectiveRig.boneMap)
       : 'None';
 
-  const savedPresets = selectedAsset?.customAnimations ?? [];
-  const savedPoses = selectedAsset?.savedPoses ?? [];
+  const savedPresets = resolvedActorLibrary.customAnimations;
+  const savedPoses = useMemo(
+    () =>
+      selectedAsset
+        ? selectedAsset.savedPoses ?? []
+        : store.currentProject?.customPoseLibrary ?? [],
+    [selectedAsset, store.currentProject?.customPoseLibrary]
+  );
+  const revealedSlots = useMemo(
+    () => getSlotsForActorCategory(selectedActor?.category ?? 'hero', activeArchetype),
+    [selectedActor?.category, activeArchetype]
+  );
   const isCurrentDefault = Boolean(
-    savedPresetId && selectedAsset?.defaultSlotPresets?.[draft.slot] === savedPresetId
+    savedPresetId && resolvedActorLibrary.defaultSlotPresets?.[draft.slot] === savedPresetId
   );
   const lastKeyTime =
     sortedKeyframes.length > 0 ? sortedKeyframes[sortedKeyframes.length - 1].time : 0;
@@ -955,11 +1181,10 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
 
   const handleCaptureSavedPose = useCallback(
     (rawName: string) => {
-      if (!selectedAsset) return;
+      if (!selectedActor) return;
       setIsPlaying(false);
       const slotLabel = SLOT_OPTIONS.find((s) => s.slot === draft.slot)?.short ?? 'Pose';
-      const existingList = selectedAsset.savedPoses ?? [];
-      const poseName = rawName.trim() || `${slotLabel} Pose ${existingList.length + 1}`;
+      const poseName = rawName.trim() || `${slotLabel} Pose ${savedPoses.length + 1}`;
       const thumbnailDataUrl = capturePoseThumbnailRef.current?.() ?? undefined;
       const newPose: SavedPosePreset = {
         id: uid(),
@@ -969,16 +1194,12 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         thumbnailDataUrl,
         createdAt: new Date().toISOString(),
       };
-      const nextPoses = [newPose, ...existingList];
       setActiveSavedPoseId(newPose.id);
       setLeftSidebarTab('poses');
-      void store.updateCustomAssetMeta({
-        ...selectedAsset,
-        savedPoses: nextPoses,
-      });
+      void store.saveUniversalPosePreset(newPose, selectedActor.target, selectedAsset ?? undefined);
       flashToast(`Captured pose "${poseName}"`);
     },
-    [selectedAsset, draft.slot, workingBones, workingHipsY, clonePoseBones, store, flashToast]
+    [selectedActor, selectedAsset, draft.slot, savedPoses.length, workingBones, workingHipsY, clonePoseBones, store, flashToast]
   );
 
   const handleApplySavedPose = useCallback(
@@ -1031,62 +1252,50 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
 
   const handleOverwriteSavedPose = useCallback(
     (poseId: string) => {
-      if (!selectedAsset) return;
-      const existingList = selectedAsset.savedPoses ?? [];
-      const target = existingList.find((p) => p.id === poseId);
+      if (!selectedActor) return;
+      const target = savedPoses.find((p) => p.id === poseId);
       if (!target) return;
       const thumbnailDataUrl = capturePoseThumbnailRef.current?.() ?? target.thumbnailDataUrl;
-      const nextPoses = existingList.map((p) =>
-        p.id === poseId
-          ? {
-              ...p,
-              bones: clonePoseBones(workingBones),
-              hipsOffsetY: workingHipsY,
-              thumbnailDataUrl,
-            }
-          : p
-      );
+      const updated: SavedPosePreset = {
+        ...target,
+        bones: clonePoseBones(workingBones),
+        hipsOffsetY: workingHipsY,
+        thumbnailDataUrl,
+      };
       setActiveSavedPoseId(poseId);
-      void store.updateCustomAssetMeta({
-        ...selectedAsset,
-        savedPoses: nextPoses,
-      });
+      void store.saveUniversalPosePreset(updated, selectedActor.target, selectedAsset ?? undefined);
       flashToast(`Updated pose "${target.name}"`);
     },
-    [selectedAsset, workingBones, workingHipsY, clonePoseBones, store, flashToast]
+    [selectedActor, selectedAsset, savedPoses, workingBones, workingHipsY, clonePoseBones, store, flashToast]
   );
 
   const handleRenameSavedPose = useCallback(
     (poseId: string, nextName: string) => {
-      if (!selectedAsset) return;
+      if (!selectedActor) return;
       const trimmed = nextName.trim();
       if (!trimmed) return;
-      const nextPoses = (selectedAsset.savedPoses ?? []).map((p) =>
-        p.id === poseId ? { ...p, name: trimmed } : p
+      const target = savedPoses.find((p) => p.id === poseId);
+      if (!target) return;
+      void store.saveUniversalPosePreset(
+        { ...target, name: trimmed },
+        selectedActor.target,
+        selectedAsset ?? undefined
       );
-      void store.updateCustomAssetMeta({
-        ...selectedAsset,
-        savedPoses: nextPoses,
-      });
     },
-    [selectedAsset, store]
+    [selectedActor, selectedAsset, savedPoses, store]
   );
 
   const handleDeleteSavedPose = useCallback(
     (poseId: string) => {
-      if (!selectedAsset) return;
-      const nextPoses = (selectedAsset.savedPoses ?? []).filter((p) => p.id !== poseId);
+      if (!selectedActor) return;
       if (activeSavedPoseId === poseId) setActiveSavedPoseId(null);
-      void store.updateCustomAssetMeta({
-        ...selectedAsset,
-        savedPoses: nextPoses,
-      });
+      void store.deleteUniversalPosePreset(poseId, selectedActor.target, selectedAsset ?? undefined);
       flashToast('Deleted saved pose');
     },
-    [selectedAsset, activeSavedPoseId, store, flashToast]
+    [selectedActor, selectedAsset, activeSavedPoseId, store, flashToast]
   );
 
-  const hasRig = Boolean(selectedAsset && effectiveRig);
+  const hasRig = Boolean(selectedActor && effectiveRig);
 
   return (
     <div className="h-full w-full flex flex-col bg-[#F4F5F8] dark:bg-[#0F1117] overflow-hidden">
@@ -1101,32 +1310,34 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           </div>
 
           <div className="inline-flex items-center p-0.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] border border-slate-200/80 dark:border-white/[0.08]">
-            <button
-              type="button"
-              onClick={() => {
-                setIsPlaying(false);
-                setStudioMode('gait');
-              }}
-              className={`px-2.5 py-1 rounded-lg text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
-                studioMode === 'gait'
-                  ? 'bg-[#7C5CFF] text-white shadow-sm'
-                  : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              <SlidersHorizontal size={12} />
-              <span>Base Gait &amp; Speed</span>
-            </button>
+            {selectedAsset && (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsPlaying(false);
+                  setStudioMode('gait');
+                }}
+                className={`px-2.5 py-1 rounded-lg text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                  studioMode === 'gait'
+                    ? 'bg-[#7C5CFF] text-white shadow-sm'
+                    : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <SlidersHorizontal size={12} />
+                <span>Base Gait</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setStudioMode('pose')}
-              className={`px-2.5 py-1 rounded-lg text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
+              className={`px-2.5 py-1 rounded-lg text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
                 studioMode === 'pose'
                   ? 'bg-[#7C5CFF] text-white shadow-sm'
                   : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
               }`}
             >
               <KeyRound size={12} />
-              <span>Keyframe Pose</span>
+              <span>Keyframe Motion</span>
             </button>
             <button
               type="button"
@@ -1134,7 +1345,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 setIsPlaying(false);
                 setStudioMode('actions');
               }}
-              className={`px-2.5 py-1 rounded-lg text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
+              className={`px-2.5 py-1 rounded-lg text-xs font-extrabold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
                 studioMode === 'actions'
                   ? 'bg-[#F59E0B] text-white shadow-sm'
                   : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
@@ -1151,7 +1362,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               value={draft.name}
               onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))}
               aria-label="Custom move name"
-              placeholder="Move name"
+              placeholder="Variation name"
               className="w-40 sm:w-48 px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] border border-slate-200/80 dark:border-white/[0.08] text-xs font-bold"
             />
           )}
@@ -1159,30 +1370,28 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           {hasRig && studioMode !== 'actions' && (
             <select
               value={draft.slot}
-              onChange={(e) =>
-                setDraft((prev) => ({ ...prev, slot: e.target.value as CustomClipSlot }))
-              }
-              aria-label="Action slot"
-              className="px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] border border-slate-200/80 dark:border-white/[0.08] text-xs font-semibold"
+              onChange={(e) => {
+                const nextSlot = e.target.value as CustomClipSlot;
+                if (studioMode === 'pose') {
+                  handleRevealPremadeSlot(nextSlot, false);
+                } else {
+                  setDraft((prev) => ({ ...prev, slot: nextSlot }));
+                }
+              }}
+              aria-label="Load premade motion slot"
+              className="px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] border border-slate-200/80 dark:border-white/[0.08] text-xs font-semibold max-w-[220px]"
             >
-              <optgroup label="Core Locomotion">
-                {SLOT_OPTIONS.filter((o) => o.group === 'core').map((opt) => (
+              <optgroup label={`${selectedActor?.category?.toUpperCase() ?? 'ACTOR'} Moves`}>
+                {revealedSlots.map((opt) => (
                   <option key={opt.slot} value={opt.slot}>
-                    Action: {opt.label}
+                    {opt.label}
                   </option>
                 ))}
               </optgroup>
-              <optgroup label="Object Interactions">
-                {SLOT_OPTIONS.filter((o) => o.group === 'object').map((opt) => (
+              <optgroup label="All Motion Slots">
+                {SLOT_OPTIONS.filter((o) => !revealedSlots.some((r) => r.slot === o.slot)).map((opt) => (
                   <option key={opt.slot} value={opt.slot}>
-                    Object: {opt.label}
-                  </option>
-                ))}
-              </optgroup>
-              <optgroup label="Character Interactions">
-                {SLOT_OPTIONS.filter((o) => o.group === 'character').map((opt) => (
-                  <option key={opt.slot} value={opt.slot}>
-                    Character: {opt.label}
+                    {opt.label}
                   </option>
                 ))}
               </optgroup>
@@ -1229,11 +1438,25 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             </>
           ) : hasRig ? (
             <>
+              <button
+                type="button"
+                onClick={() => setCompareOriginal((v) => !v)}
+                title="Compare built-in original sequence side-by-side in preview against your variation"
+                className={`px-2.5 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+                  compareOriginal
+                    ? 'bg-[#06B6D4] text-slate-950'
+                    : 'bg-slate-100 dark:bg-[#1F2430] text-slate-700 dark:text-[#C8D0E4] hover:bg-slate-200 dark:hover:bg-[#2A3142]'
+                }`}
+              >
+                <GitCompare size={13} />
+                <span>{compareOriginal ? 'Viewing Original' : 'Compare Original'}</span>
+              </button>
+
               {savedPresetId && (
                 <button
                   type="button"
                   onClick={handleSaveOverwrite}
-                  className="px-3 py-1.5 rounded-lg bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap"
+                  className="px-3 py-1.5 rounded-lg bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
                 >
                   <Save size={13} />
                   <span>Save</span>
@@ -1243,46 +1466,45 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               <button
                 type="button"
                 onClick={handleSaveAsNew}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap ${
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                   savedPresetId
                     ? 'bg-slate-100 dark:bg-[#1F2430] hover:bg-slate-200 dark:hover:bg-[#2A3142] text-slate-900 dark:text-white'
                     : 'bg-[#7C5CFF] hover:bg-[#6A48F5] text-white'
                 }`}
               >
                 <Plus size={13} />
-                <span>{savedPresetId ? 'Save As New' : 'Save Preset'}</span>
+                <span>{savedPresetId ? 'Save Variation' : 'Save Preset'}</span>
               </button>
 
-              {savedPresetId && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    handleSetDefaultForSlot(draft.slot, isCurrentDefault ? null : savedPresetId)
+              <button
+                type="button"
+                onClick={() => {
+                  const assignPreset = buildFinalizedDraft(
+                    savedPresetId ?? uid(),
+                    draft.name
+                  );
+                  if (!savedPresetId) {
+                    setDraft(assignPreset);
+                    setSavedPresetId(assignPreset.id);
+                    setIsDirtyPose(false);
                   }
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
-                    isCurrentDefault
-                      ? 'bg-[#20B46A] text-white'
-                      : 'bg-[#20B46A]/15 text-[#16A34A] dark:text-[#34D399] hover:bg-[#20B46A]/25'
-                  }`}
-                >
-                  <Star size={12} className={isCurrentDefault ? 'fill-current' : ''} />
-                  <span>
-                    {isCurrentDefault
-                      ? `Default ${SLOT_OPTIONS.find((s) => s.slot === draft.slot)?.short}`
-                      : `Set Default ${SLOT_OPTIONS.find((s) => s.slot === draft.slot)?.short}`}
-                  </span>
-                </button>
-              )}
+                  setAssignModalOpen(true);
+                }}
+                className="px-3 py-1.5 rounded-lg bg-[#20B46A] hover:bg-[#1A9E5C] text-white text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              >
+                <Star size={12} className={isCurrentDefault ? 'fill-current' : ''} />
+                <span>Assign</span>
+              </button>
 
               <button
                 type="button"
                 disabled={boneNames.length === 0}
                 onClick={() => handleCaptureSavedPose('')}
                 title="Capture the current joint positions as a reusable thumbnail in Saved Poses"
-                className="px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF] hover:text-white text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:opacity-40"
+                className="px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF] hover:text-white text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors disabled:opacity-40"
               >
                 <Camera size={12} />
-                <span>Capture Pose</span>
+                <span>Pose</span>
               </button>
             </>
           ) : null}
@@ -1317,140 +1539,119 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         <div className="flex-1 min-h-0 overflow-hidden">
           <ActionsStage store={store} />
         </div>
-      ) : !selectedAsset || !effectiveRig ? (
+      ) : !selectedActor || !effectiveRig ? (
         <div className="flex-1 min-h-0 flex flex-col items-center justify-center p-6 text-center">
           <div className="max-w-md space-y-4">
             <div className="mx-auto w-14 h-14 rounded-2xl bg-[#7C5CFF]/15 text-[#7C5CFF] flex items-center justify-center">
               <Film size={26} />
             </div>
-            <h2 className="text-xl font-black tracking-tight">Character Motion Maker</h2>
+            <h2 className="text-xl font-black tracking-tight">Universal Motion Studio</h2>
             <p className="text-sm text-slate-600 dark:text-[#949BB0]">
-              Import a rigged 3D character (.glb or .gltf) to pose joints directly in 3D, keyframe
-              custom looping animations on the timeline, and set them as default game moves.
+              Load premade animations for Heroes, NPCs, Buddy Partners, and Dragons/Bosses or import a .glb model.
             </p>
             {uploadErr && (
               <div className="px-3 py-2 rounded-xl bg-[#F2545B]/15 text-[#F2545B] text-xs font-semibold">
                 {uploadErr}
               </div>
             )}
-            <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
-              <button
-                type="button"
-                disabled={uploading}
-                onClick={() => fileInputRef.current?.click()}
-                className="px-4 py-2.5 rounded-xl bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-xs font-bold inline-flex items-center gap-2"
-              >
-                <Upload size={14} />
-                <span>{uploading ? 'Importing…' : 'Import Rigged GLB'}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => store.setShowingAssetVault(true)}
-                className="px-4 py-2.5 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200 dark:border-white/[0.1] text-xs font-bold inline-flex items-center gap-2"
-              >
-                <Box size={14} className="text-[#7C5CFF]" />
-                <span>Open 3D Asset Vault</span>
-              </button>
-            </div>
           </div>
         </div>
       ) : (
         <>
           {/* MAIN 3-COLUMN WORKSPACE */}
           <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden maker-scroll">
-        {/* LEFT SIDEBAR: SAVED POSES & MOVES LIBRARY */}
-        <aside className="w-full lg:w-64 xl:w-72 shrink-0 lg:h-full lg:overflow-y-auto maker-scroll bg-white dark:bg-[#171A23] border-b lg:border-b-0 lg:border-r border-slate-200/80 dark:border-white/[0.08] p-3.5 space-y-3.5">
-          {/* Active Character Bar */}
-          <div className="flex items-center gap-2 p-2 rounded-xl bg-slate-50 dark:bg-[#12151E] border border-slate-200/70 dark:border-white/[0.08]">
-            <div className="w-9 h-9 rounded-lg bg-slate-200/70 dark:bg-[#0B0E16] overflow-hidden shrink-0 flex items-center justify-center">
-              {selectedAsset.thumbnailDataUrl ? (
-                <img
-                  src={selectedAsset.thumbnailDataUrl}
-                  alt={selectedAsset.name}
-                  className="w-full h-full object-contain"
-                />
-              ) : (
-                <Box size={15} className="text-slate-400" />
-              )}
-            </div>
-            <div className="min-w-0 flex-1">
-              {riggedAssets.length > 1 ? (
-                <select
-                  value={selectedAsset.id}
-                  onChange={(e) => {
-                    setSelectedAssetId(e.target.value);
-                    store.setMotionAssetId(e.target.value);
-                  }}
-                  aria-label="Select character"
-                  className="w-full bg-transparent text-xs font-extrabold truncate focus:outline-none cursor-pointer"
-                >
-                  {riggedAssets.map((asset) => (
-                    <option key={asset.id} value={asset.id} className="bg-white dark:bg-[#171A23]">
-                      {asset.name}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <div className="text-xs font-extrabold truncate">{selectedAsset.name}</div>
-              )}
-              <div className="flex items-center justify-between gap-2 text-[10px] text-slate-500 dark:text-[#949BB0]">
-                <span className="truncate">
-                  {savedPoses.length} poses · {savedPresets.length} moves
-                </span>
+        {/* LEFT SIDEBAR: ACTOR PICKER + REVEALED MOVES + SAVED POSES */}
+        <aside className="w-full lg:w-72 xl:w-80 shrink-0 lg:h-full lg:overflow-y-auto maker-scroll bg-white dark:bg-[#171A23] border-b lg:border-b-0 lg:border-r border-slate-200/80 dark:border-white/[0.08] p-3.5 space-y-3.5">
+          {/* Category Filter Tabs + Character Picker */}
+          <div className="space-y-2">
+            <div className="flex flex-wrap gap-1 p-1 rounded-xl bg-slate-100 dark:bg-[#12151E] border border-slate-200/70 dark:border-white/[0.08]">
+              {CATEGORY_TABS.map((cat) => (
                 <button
+                  key={cat.id}
                   type="button"
-                  onClick={() => store.setShowingAssetVault(true)}
-                  className="text-[#7C5CFF] font-bold hover:underline shrink-0"
+                  onClick={() => {
+                    setCategoryFilter(cat.id);
+                    if (cat.id !== 'all' && selectedActor.category !== cat.id) {
+                      const firstInCat = studioActors.find((a) => a.category === cat.id);
+                      if (firstInCat) {
+                        setSelectedActorId(firstInCat.id);
+                        store.setMotionActorTarget(firstInCat.target);
+                      }
+                    }
+                  }}
+                  className={`px-2 py-1 rounded-lg text-[10px] font-extrabold transition-colors whitespace-nowrap shrink-0 ${
+                    categoryFilter === cat.id
+                      ? 'bg-[#7C5CFF] text-white'
+                      : 'text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
+                  }`}
                 >
-                  Rig
+                  {cat.label}
                 </button>
+              ))}
+            </div>
+
+            <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-[#12151E] border border-slate-200/70 dark:border-white/[0.08] space-y-1">
+              <select
+                value={selectedActor.id}
+                onChange={(e) => {
+                  const found = studioActors.find((a) => a.id === e.target.value);
+                  if (found) {
+                    setSelectedActorId(found.id);
+                    store.setMotionActorTarget(found.target);
+                    if (found.target.kind === 'customAsset') {
+                      store.setMotionAssetId(found.target.assetId);
+                    }
+                  }
+                }}
+                aria-label="Select character or creature"
+                className="w-full bg-transparent text-xs font-extrabold focus:outline-none cursor-pointer text-slate-900 dark:text-white"
+              >
+                {filteredActors.map((act) => (
+                  <option key={act.id} value={act.id} className="bg-white dark:bg-[#171A23]">
+                    {act.label}
+                  </option>
+                ))}
+              </select>
+              <div className="flex items-center justify-between gap-2 text-[10px] text-slate-500 dark:text-[#949BB0] tabular-nums">
+                <span className="truncate">{selectedActor.subtitle || selectedActor.category}</span>
+                {selectedAsset && (
+                  <button
+                    type="button"
+                    onClick={() => store.setShowingAssetVault(true)}
+                    className="text-[#7C5CFF] font-bold hover:underline shrink-0"
+                  >
+                    Rig
+                  </button>
+                )}
               </div>
             </div>
           </div>
 
-          {/* Sidebar Mode Tabs: Saved Poses | Moves & Rig */}
+          {/* Sidebar Mode Tabs: Moves & Presets | Saved Poses */}
           <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-slate-100 dark:bg-[#12151E] border border-slate-200/70 dark:border-white/[0.08]">
             <button
               type="button"
-              onClick={() => setLeftSidebarTab('poses')}
-              className={`py-1.5 px-2 rounded-lg text-[11px] font-bold inline-flex items-center justify-center gap-1.5 transition-colors ${
-                leftSidebarTab === 'poses'
-                  ? 'bg-[#7C5CFF] text-white shadow-sm'
-                  : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              <Bookmark size={12} />
-              <span>Saved Poses</span>
-              <span
-                className={`px-1.5 py-0.2 rounded-full text-[10px] tabular-nums ${
-                  leftSidebarTab === 'poses'
-                    ? 'bg-white/20 text-white'
-                    : 'bg-slate-200/90 dark:bg-[#1F2430] text-slate-600 dark:text-[#B8C0D6]'
-                }`}
-              >
-                {savedPoses.length}
-              </span>
-            </button>
-            <button
-              type="button"
               onClick={() => setLeftSidebarTab('library')}
-              className={`py-1.5 px-2 rounded-lg text-[11px] font-bold inline-flex items-center justify-center gap-1.5 transition-colors ${
+              className={`py-1.5 px-2 rounded-lg text-[11px] font-bold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
                 leftSidebarTab === 'library'
                   ? 'bg-[#7C5CFF] text-white shadow-sm'
                   : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
               }`}
             >
               <Film size={12} />
-              <span>Moves</span>
-              <span
-                className={`px-1.5 py-0.2 rounded-full text-[10px] tabular-nums ${
-                  leftSidebarTab === 'library'
-                    ? 'bg-white/20 text-white'
-                    : 'bg-slate-200/90 dark:bg-[#1F2430] text-slate-600 dark:text-[#B8C0D6]'
-                }`}
-              >
-                {savedPresets.length}
-              </span>
+              <span>Moves ({revealedSlots.length + savedPresets.length})</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setLeftSidebarTab('poses')}
+              className={`py-1.5 px-2 rounded-lg text-[11px] font-bold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                leftSidebarTab === 'poses'
+                  ? 'bg-[#7C5CFF] text-white shadow-sm'
+                  : 'text-slate-600 dark:text-[#A5AEC4] hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <Bookmark size={12} />
+              <span>Poses ({savedPoses.length})</span>
             </button>
           </div>
 
@@ -1469,30 +1670,78 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             />
           ) : (
             <div className="space-y-4">
-              {/* Saved Moves Library */}
+              {/* Revealed Premade Built-In Motions */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between text-[11px] font-bold text-slate-500 dark:text-[#949BB0]">
-                  <span>Saved Moves ({savedPresets.length})</span>
+                  <span>Premade Motions ({revealedSlots.length})</span>
+                  <span className="text-[10px]">Load to Edit</span>
+                </div>
+                <div className="space-y-1.5 max-h-64 overflow-y-auto maker-scroll pr-0.5">
+                  {revealedSlots.map((meta) => {
+                    const active = draft.slot === meta.slot;
+                    const assignedId = resolvedActorLibrary.defaultSlotPresets?.[meta.slot];
+                    const assignedPreset = assignedId
+                      ? savedPresets.find((p) => p.id === assignedId)
+                      : undefined;
+                    return (
+                      <div
+                        key={meta.slot}
+                        className={`p-2 rounded-xl border transition-colors ${
+                          active
+                            ? 'border-[#7C5CFF] bg-[#7C5CFF]/10'
+                            : 'border-slate-200/70 dark:border-white/[0.08] bg-slate-50 dark:bg-[#12151E]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-1.5">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs font-extrabold truncate text-slate-900 dark:text-white">
+                              {meta.label}
+                            </div>
+                            <div className="text-[10px] text-slate-500 dark:text-[#949BB0] tabular-nums truncate">
+                              {assignedPreset ? `Assigned: ${assignedPreset.name}` : 'Built-in'} ·{' '}
+                              {meta.defaultDurationSec}s · {meta.defaultLoop ? 'Loop' : 'Once'}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleRevealPremadeSlot(meta.slot, true)}
+                            className="px-2 py-1 rounded-lg bg-[#7C5CFF] hover:bg-[#6A48F5] text-white text-[10px] font-bold whitespace-nowrap shrink-0"
+                          >
+                            Load &amp; Edit
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Saved Custom Variations */}
+              <div className="space-y-2 pt-3 border-t border-slate-200/70 dark:border-white/[0.08]">
+                <div className="flex items-center justify-between text-[11px] font-bold text-slate-500 dark:text-[#949BB0]">
+                  <span>Saved Variations ({savedPresets.length})</span>
                   <button
                     type="button"
                     onClick={() => handleCreateNewDraft(draft.slot)}
                     className="text-[#7C5CFF] hover:underline inline-flex items-center gap-0.5"
                   >
                     <Plus size={11} />
-                    <span>New</span>
+                    <span>Reset Slot</span>
                   </button>
                 </div>
 
                 {savedPresets.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-slate-300 dark:border-white/[0.1] p-3 text-[11px] text-slate-500 dark:text-[#949BB0] leading-relaxed">
-                    Pose joints in the 3D stage, save keyframes on the timeline below, then click{' '}
-                    <strong className="text-slate-700 dark:text-white">Save Preset</strong>.
+                    Click <strong className="text-slate-700 dark:text-white">Load &amp; Edit</strong> on any
+                    premade move above, tweak keyframes on the timeline, then click{' '}
+                    <strong className="text-slate-700 dark:text-white">Save Preset</strong> or{' '}
+                    <strong className="text-slate-700 dark:text-white">Assign</strong>.
                   </div>
                 ) : (
                   <div className="space-y-1.5">
                     {savedPresets.map((preset) => {
                       const isEditing = savedPresetId === preset.id;
-                      const isDefault = selectedAsset.defaultSlotPresets?.[preset.slot] === preset.id;
+                      const isDefault = resolvedActorLibrary.defaultSlotPresets?.[preset.slot] === preset.id;
                       const slotShort =
                         SLOT_OPTIONS.find((s) => s.slot === preset.slot)?.short ?? preset.slot;
                       return (
@@ -1512,8 +1761,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                             >
                               <div className="text-xs font-extrabold truncate">{preset.name}</div>
                               <div className="text-[10px] text-slate-500 dark:text-[#949BB0] tabular-nums">
-                                {slotShort} · {preset.duration.toFixed(1)}s · {preset.keyframes.length}{' '}
-                                keys
+                                {slotShort} · {preset.duration.toFixed(1)}s · {preset.keyframes.length} keys
                               </div>
                             </button>
                             <button
@@ -1521,7 +1769,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                               onClick={() =>
                                 handleSetDefaultForSlot(preset.slot, isDefault ? null : preset.id)
                               }
-                              title={isDefault ? 'Unset as default' : `Set as default ${slotShort}`}
+                              title={isDefault ? 'Restore built-in default' : `Assign as default ${slotShort}`}
                               className={`px-2 py-1 rounded-lg text-[10px] font-bold inline-flex items-center gap-1 shrink-0 ${
                                 isDefault
                                   ? 'bg-[#20B46A] text-white'
@@ -1529,12 +1777,12 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                               }`}
                             >
                               <Star size={10} className={isDefault ? 'fill-current' : ''} />
-                              <span>{isDefault ? 'Default' : 'Use'}</span>
+                              <span>{isDefault ? 'Assigned' : 'Use'}</span>
                             </button>
                             <button
                               type="button"
                               onClick={() => handleDeletePreset(preset.id)}
-                              title="Delete preset"
+                              title="Delete variation"
                               className="p-1 rounded-md text-slate-400 hover:text-[#F2545B] hover:bg-[#F2545B]/10 shrink-0"
                             >
                               <Trash2 size={12} />
@@ -1546,49 +1794,6 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   </div>
                 )}
               </div>
-
-              {/* Action Slot Defaults Overview */}
-              <div className="space-y-1.5 pt-3 border-t border-slate-200/70 dark:border-white/[0.08]">
-                <div className="text-[11px] font-bold text-slate-500 dark:text-[#949BB0]">
-                  Action Slot Defaults
-                </div>
-                <div className="space-y-1">
-                  {SLOT_OPTIONS.map(({ slot, short }) => {
-                    const defId = selectedAsset.defaultSlotPresets?.[slot];
-                    const defPreset = defId
-                      ? savedPresets.find((p) => p.id === defId)
-                      : undefined;
-                    return (
-                      <div
-                        key={slot}
-                        className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg bg-slate-50 dark:bg-[#12151E] text-[11px]"
-                      >
-                        <span className="font-bold text-slate-700 dark:text-[#D5DCF0] shrink-0">
-                          {short}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (defPreset) {
-                              handleLoadPreset(defPreset);
-                            } else {
-                              handleCreateNewDraft(slot);
-                              handleGrabLivePose(slot);
-                            }
-                          }}
-                          className={`truncate text-right font-semibold hover:underline ${
-                            defPreset
-                              ? 'text-[#16A34A] dark:text-[#34D399]'
-                              : 'text-slate-500 dark:text-[#8E96AB]'
-                          }`}
-                        >
-                          {defPreset ? defPreset.name : 'Built-in / GLB'}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
             </div>
           )}
         </aside>
@@ -1597,6 +1802,11 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         <main className="flex-1 min-w-0 min-h-[360px] lg:min-h-0 relative bg-[#111521]">
           <RigPreviewStage
             asset={stageAsset ?? selectedAsset}
+            actorTarget={selectedActor.target}
+            project={store.currentProject}
+            currentLevel={store.currentLevel}
+            customAssets={store.customAssets}
+            contextProps={contextProps}
             rigSettings={stageRig ?? effectiveRig}
             boneNames={boneNames}
             previewSlot={draft.slot}
@@ -1607,13 +1817,13 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             cameraResetNonce={cameraResetNonce}
             testOverride={effectiveTestOverride}
             highlightBoneName={studioMode === 'pose' ? selectedBone : null}
-            poseMode={studioMode === 'pose' && boneNames.length > 0}
+            poseMode={studioMode === 'pose' && boneNames.length > 0 && !compareOriginal}
             motionPlaying={studioMode === 'pose' ? isPlaying : false}
             workingBones={workingBones}
             ghostStartPose={studioMode === 'pose' ? ghostStartPose : null}
-            onionSkin={studioMode === 'pose' ? onionSkinConfig : null}
-            showGizmo={studioMode === 'pose' && showGizmo}
-            showJointDots={studioMode === 'pose' && showJointDots}
+            onionSkin={studioMode === 'pose' && selectedAsset ? onionSkinConfig : null}
+            showGizmo={studioMode === 'pose' && showGizmo && !compareOriginal}
+            showJointDots={studioMode === 'pose' && showJointDots && !compareOriginal}
             gizmoSize={GIZMO_SIZE_MAP[gizmoSizePreset]}
             gizmoAxisFilter={gizmoAxisFilter}
             lockCameraOrbit={lockCameraOrbit}
@@ -1623,6 +1833,9 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             onPlayheadTick={setPlayhead}
             captureLivePoseRef={captureLivePoseRef}
             capturePoseThumbnailRef={capturePoseThumbnailRef}
+            onRuntimeReady={(info) => {
+              setRuntimeInfo(info);
+            }}
           />
 
           {/* Compact Top-Left Camera Controls + Orbit Lock for Touch */}
@@ -1747,6 +1960,77 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             )}
           </div>
 
+          {/* Context Props Bar (Hero Sword/Shield/Axe OR Enemy Attack Telegraph Range) */}
+          {(runtimeInfo?.hasHeroProps || runtimeInfo?.hasTelegraph) && (
+            <div className="absolute top-14 left-3 flex flex-wrap items-center gap-1 p-1 rounded-xl bg-[#171A23]/95 border border-white/[0.12] z-10">
+              {runtimeInfo?.hasHeroProps && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setContextProps((p) => ({
+                        ...p,
+                        weapon: p.weapon === 'sword' ? 'none' : 'sword',
+                      }))
+                    }
+                    className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 whitespace-nowrap ${
+                      contextProps.weapon === 'sword'
+                        ? 'bg-[#7C5CFF] text-white'
+                        : 'text-[#C8D0E4] hover:text-white hover:bg-white/10'
+                    }`}
+                  >
+                    <Sword size={11} />
+                    <span>Sword</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setContextProps((p) => ({
+                        ...p,
+                        weapon: p.weapon === 'axe' ? 'none' : 'axe',
+                      }))
+                    }
+                    className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 whitespace-nowrap ${
+                      contextProps.weapon === 'axe'
+                        ? 'bg-[#7C5CFF] text-white'
+                        : 'text-[#C8D0E4] hover:text-white hover:bg-white/10'
+                    }`}
+                  >
+                    <span>Axe</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setContextProps((p) => ({ ...p, shield: !p.shield }))}
+                    className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 whitespace-nowrap ${
+                      contextProps.shield
+                        ? 'bg-[#20B46A] text-white'
+                        : 'text-[#C8D0E4] hover:text-white hover:bg-white/10'
+                    }`}
+                  >
+                    <Shield size={11} />
+                    <span>Shield</span>
+                  </button>
+                </>
+              )}
+              {runtimeInfo?.hasTelegraph && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setContextProps((p) => ({ ...p, showTelegraph: !p.showTelegraph }))
+                  }
+                  className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center gap-1 whitespace-nowrap ${
+                    contextProps.showTelegraph
+                      ? 'bg-[#FF5E3A] text-white'
+                      : 'text-[#C8D0E4] hover:text-white hover:bg-white/10'
+                  }`}
+                >
+                  <Target size={11} />
+                  <span>Attack Zone</span>
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Touch-Friendly Gizmo Size & Axis Isolation Dock */}
           {studioMode === 'pose' && boneNames.length > 0 && showGizmo && !isPlaying && (
             <div className="absolute bottom-9 left-1/2 -translate-x-1/2 flex flex-wrap items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-2xl bg-[#171A23]/95 border border-white/[0.14] shadow-lg z-10 max-w-[95%]">
@@ -1818,7 +2102,7 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             <div className="py-10 text-center text-xs text-slate-500 dark:text-[#949BB0]">
               No skeleton bones detected on this model. Import a rigged character to animate joints.
             </div>
-          ) : studioMode === 'gait' && stageRig ? (
+          ) : studioMode === 'gait' && stageRig && selectedAsset ? (
             <div className="space-y-4">
               {/* Motion Type Picker */}
               <div className="space-y-2">
@@ -2339,6 +2623,91 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   </div>
                 </div>
 
+                {/* Quadruped Wings & Tail if present */}
+                {(bodySilhouette.leftWing.length > 0 ||
+                  bodySilhouette.rightWing.length > 0 ||
+                  bodySilhouette.tail.length > 0) && (
+                  <div className="grid grid-cols-3 gap-1.5 pt-1">
+                    <div className="space-y-1">
+                      <div className="text-[10px] font-bold text-center text-slate-400 dark:text-[#7E869C]">
+                        L Wing
+                      </div>
+                      {bodySilhouette.leftWing.map((item) => {
+                        const active = selectedBone === item.boneName;
+                        const edited = Boolean(workingBones[item.boneName]);
+                        return (
+                          <button
+                            key={item.boneName}
+                            type="button"
+                            onClick={() => handleSelectBone(item.boneName)}
+                            className={`w-full px-1.5 py-1.5 rounded-lg text-[11px] font-bold truncate transition-colors ${
+                              active
+                                ? 'bg-[#F59E0B] text-slate-950'
+                                : edited
+                                ? 'bg-[#7C5CFF]/18 text-[#6A48F5] dark:text-[#C4B5FD] border border-[#7C5CFF]/35'
+                                : 'bg-slate-100 dark:bg-[#1F2430] text-slate-700 dark:text-[#C8D0E4] hover:bg-slate-200 dark:hover:bg-[#2A3142]'
+                            }`}
+                          >
+                            {item.label.replace(/^L /, '')}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="text-[10px] font-bold text-center text-slate-400 dark:text-[#7E869C]">
+                        Tail
+                      </div>
+                      {bodySilhouette.tail.map((item) => {
+                        const active = selectedBone === item.boneName;
+                        const edited = Boolean(workingBones[item.boneName]);
+                        return (
+                          <button
+                            key={item.boneName}
+                            type="button"
+                            onClick={() => handleSelectBone(item.boneName)}
+                            className={`w-full px-1.5 py-1.5 rounded-lg text-[11px] font-bold truncate transition-colors ${
+                              active
+                                ? 'bg-[#F59E0B] text-slate-950'
+                                : edited
+                                ? 'bg-[#7C5CFF]/18 text-[#6A48F5] dark:text-[#C4B5FD] border border-[#7C5CFF]/35'
+                                : 'bg-slate-100 dark:bg-[#1F2430] text-slate-700 dark:text-[#C8D0E4] hover:bg-slate-200 dark:hover:bg-[#2A3142]'
+                            }`}
+                          >
+                            {item.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="text-[10px] font-bold text-center text-slate-400 dark:text-[#7E869C]">
+                        R Wing
+                      </div>
+                      {bodySilhouette.rightWing.map((item) => {
+                        const active = selectedBone === item.boneName;
+                        const edited = Boolean(workingBones[item.boneName]);
+                        return (
+                          <button
+                            key={item.boneName}
+                            type="button"
+                            onClick={() => handleSelectBone(item.boneName)}
+                            className={`w-full px-1.5 py-1.5 rounded-lg text-[11px] font-bold truncate transition-colors ${
+                              active
+                                ? 'bg-[#F59E0B] text-slate-950'
+                                : edited
+                                ? 'bg-[#7C5CFF]/18 text-[#6A48F5] dark:text-[#C4B5FD] border border-[#7C5CFF]/35'
+                                : 'bg-slate-100 dark:bg-[#1F2430] text-slate-700 dark:text-[#C8D0E4] hover:bg-slate-200 dark:hover:bg-[#2A3142]'
+                            }`}
+                          >
+                            {item.label.replace(/^R /, '')}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {/* Lower Body Grid: Left Leg | Right Leg */}
                 <div className="grid grid-cols-2 gap-1.5 pt-1">
                   <div className="space-y-1">
@@ -2814,6 +3183,20 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 );
               })}
 
+              {/* Gameplay Event Markers (windup lock, impact hit, grounded) */}
+              {(draft.events ?? []).map((ev) => (
+                <div
+                  key={ev.id}
+                  style={{ left: `${ev.time * 100}%` }}
+                  title={`${ev.label ?? ev.kind} (${Math.round(ev.time * 100)}%)`}
+                  className="absolute top-0.5 -translate-x-1/2 pointer-events-none z-10 flex flex-col items-center"
+                >
+                  <span className="px-1 rounded text-[8px] font-extrabold bg-[#FF5E3A] text-white whitespace-nowrap leading-tight">
+                    {ev.label ?? ev.kind}
+                  </span>
+                </div>
+              ))}
+
               {/* Playhead needle */}
               <div
                 style={{ left: `${playhead * 100}%` }}
@@ -2823,34 +3206,74 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               </div>
             </div>
 
-            {/* Row 3: Time ticks + Seamless Loop Guide */}
+            {/* Row 3: Fit-Check Guardrail Bar & Seamless Loop Guide */}
             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] pt-0.5">
-              {draft.loop && loopReport ? (
-                <div className="flex flex-wrap items-center gap-2 min-w-0">
-                  <span
-                    className={`font-bold ${
-                      loopReport.isSeamless
-                        ? 'text-[#16A34A] dark:text-[#34D399]'
-                        : 'text-[#D97706] dark:text-[#FBBF24]'
-                    }`}
-                  >
-                    {loopReport.isAutoClosed
-                      ? 'Loop Guide · Auto-Blend to Start (100% seamless)'
-                      : loopReport.isSeamless
-                      ? 'Loop Guide · Start & End Match (100% seamless)'
-                      : `Loop Seam · ${loopReport.matchPercent}% match (${loopReport.maxDiffDeg}° off)`}
-                  </span>
-                  {!loopReport.isSeamless && loopReport.mismatchedJoints.length > 0 && (
-                    <span className="text-slate-500 dark:text-[#949BB0] truncate">
-                      Adjust: {loopReport.mismatchedJoints.join(', ')}
-                    </span>
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                <span
+                  className={`inline-flex items-center gap-1 font-bold ${
+                    fitReport.status === 'safe'
+                      ? 'text-[#16A34A] dark:text-[#34D399]'
+                      : 'text-[#D97706] dark:text-[#FBBF24]'
+                  }`}
+                >
+                  {fitReport.status === 'safe' ? (
+                    <CheckCircle2 size={12} />
+                  ) : (
+                    <AlertTriangle size={12} />
                   )}
-                </div>
-              ) : (
-                <span className="text-slate-500 dark:text-[#8E96AB]">
-                  One-shot action · Clamps cleanly on final keyframe
+                  <span>
+                    {fitReport.status === 'safe'
+                      ? `Safe to Assign · ${fitReport.matchedBoneCount}/${fitReport.totalPresetBones || boneNames.length} joints`
+                      : fitReport.warnings[0]?.message ?? 'Fit Caution'}
+                  </span>
                 </span>
-              )}
+
+                {fitReport.warnings.some((w) => w.code === 'tooLong' || w.code === 'tooShort') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = autoFitPresetTiming(draft);
+                      setDraft(next);
+                      flashToast(`Fitted duration to ${next.duration.toFixed(2)}s`);
+                    }}
+                    className="px-2 py-0.5 rounded bg-[#7C5CFF]/15 text-[#7C5CFF] font-bold inline-flex items-center gap-1 whitespace-nowrap"
+                  >
+                    <Wand2 size={10} />
+                    <span>Auto-Fit Timing</span>
+                  </button>
+                )}
+
+                {fitReport.warnings.some((w) => w.code === 'extremeAngle' || w.code === 'floorClip') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = clampPresetToNaturalRange(draft, activeArchetype);
+                      setDraft(next);
+                      const sampled = sampleMotionPresetToPose(next, playhead);
+                      setWorkingBones(sampled.bones);
+                      setWorkingHipsY(sampled.hipsOffsetY);
+                      flashToast('Clamped angles to natural character range');
+                    }}
+                    className="px-2 py-0.5 rounded bg-[#F59E0B]/15 text-[#D97706] dark:text-[#FBBF24] font-bold whitespace-nowrap"
+                  >
+                    Clamp Safe Range
+                  </button>
+                )}
+
+                {draft.loop && loopReport && !loopReport.isSeamless && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = autoBlendLoopSeam(draft);
+                      setDraft(next);
+                      flashToast('Blended loop seam cleanly');
+                    }}
+                    className="px-2 py-0.5 rounded bg-[#06B6D4]/20 text-[#0E7490] dark:text-[#22D3EE] font-bold whitespace-nowrap"
+                  >
+                    Blend Seam ({loopReport.maxDiffDeg}° off)
+                  </button>
+                )}
+              </div>
 
               {draft.loop && (
                 <div className="flex flex-wrap items-center gap-2">
@@ -2894,6 +3317,49 @@ export const MotionStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         </section>
       )}
         </>
+      )}
+
+      {assignModalOpen && selectedActor && (
+        <MotionAssignModal
+          preset={draft}
+          target={selectedActor.target}
+          category={selectedActor.category}
+          archetype={activeArchetype}
+          boneNames={boneNames}
+          project={store.currentProject}
+          currentLevel={store.currentLevel}
+          customAsset={selectedAsset}
+          onUpdatePreset={(next) => {
+            setDraft(next);
+            const sampled = sampleMotionPresetToPose(next, playhead);
+            setWorkingBones(sampled.bones);
+            setWorkingHipsY(sampled.hipsOffsetY);
+          }}
+          onAssign={async ({ preset, slot, scope, entityId }) => {
+            await store.assignMotionPresetToScope({
+              preset,
+              slot,
+              scope,
+              target: selectedActor.target,
+              entityId,
+              blueprint: resolvedActorLibrary.monsterBlueprint,
+              customAssetMeta: selectedAsset ?? undefined,
+            });
+            flashToast(`Assigned "${preset.name}" to ${slot}`);
+          }}
+          onRestoreDefault={async ({ slot, scope, entityId }) => {
+            await store.restoreDefaultMotionSlot({
+              slot,
+              scope,
+              target: selectedActor.target,
+              entityId,
+              customAssetMeta: selectedAsset ?? undefined,
+            });
+            handleRevealPremadeSlot(slot, false);
+            flashToast(`Restored built-in default for ${slot}`);
+          }}
+          onClose={() => setAssignModalOpen(false)}
+        />
       )}
     </div>
   );

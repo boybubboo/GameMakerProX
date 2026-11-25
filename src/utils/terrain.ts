@@ -1990,6 +1990,18 @@ export function sampleTerrainHeight(terrain: TerrainData | undefined, x: number,
   );
 }
 
+export function sampleTerrainLayer(terrain: TerrainData | undefined, x: number, z: number): number {
+  if (!terrain?.layers || terrain.layers.length !== (terrain.size + 1) * (terrain.size + 1)) {
+    return 0;
+  }
+  const size = terrain.size;
+  const width = size + 1;
+  const r = getTerrainRadius(terrain);
+  const fx = Math.max(0, Math.min(size, Math.round(((x + r) / (2 * r)) * size)));
+  const fz = Math.max(0, Math.min(size, Math.round(((z + r) / (2 * r)) * size)));
+  return terrain.layers[fz * width + fx] ?? 0;
+}
+
 export function sampleLevelHeight(level: GameLevel, x: number, z: number): number {
   const env = getEnvironmentType(level);
   if (env === 'dungeon') {

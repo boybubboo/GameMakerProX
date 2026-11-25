@@ -25,6 +25,7 @@ export interface CreatureAnimRefs {
 export interface HeroRig {
   group: THREE.Group;
   bodyPivot: THREE.Group;
+  spinePivot?: THREE.Group;
   shadowDisc: THREE.Mesh;
   head: THREE.Group;
   torso: THREE.Mesh;
@@ -42,7 +43,7 @@ export interface HeroRig {
   fishingRodTip?: THREE.Object3D;
   torch?: THREE.Group;
   heldGeneric?: THREE.Mesh;
-  shield?: THREE.Mesh;
+  shield?: THREE.Group | THREE.Mesh;
   wearHeadHat?: THREE.Group;
   wearHeadCrown?: THREE.Group;
   wearBodyCloak?: THREE.Mesh;
@@ -614,6 +615,7 @@ export function buildCreatureMesh(
   // Hide humanoid hero weapons on creature NPCs
   if (rig.sword) rig.sword.visible = false;
   if (rig.shield) rig.shield.visible = false;
+  rig.group.userData.heroRig = rig;
   return rig.group;
 }
 
@@ -1091,15 +1093,26 @@ export function buildHeroModel(
 
   // Body pivot around chest/hip center (0, 0.85, 0) so swimming leans cleanly without tilting ground shadow
   const bodyPivot = new THREE.Group();
+  bodyPivot.name = 'Hips';
   bodyPivot.position.set(0, 0.85, 0);
   const bodyRoot = new THREE.Group();
   bodyRoot.position.set(0, -0.85, 0);
   bodyPivot.add(bodyRoot);
   group.add(bodyPivot);
 
+  // Articulated waist spine pivot at y=0.56 so torso/arms/head bend together naturally
+  const spinePivot = new THREE.Group();
+  spinePivot.name = 'Spine';
+  spinePivot.position.set(0, 0.56, 0);
+  const upperBodyRoot = new THREE.Group();
+  upperBodyRoot.position.set(0, -0.56, 0);
+  spinePivot.add(upperBodyRoot);
+  bodyRoot.add(spinePivot);
+
   // Legs
-  const makeLeg = (x: number) => {
+  const makeLeg = (x: number, name: string) => {
     const legPivot = new THREE.Group();
+    legPivot.name = name;
     legPivot.position.set(x, 0.52, 0);
     const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.11, 0.24, 6, 10), darkMat);
     thigh.position.y = -0.2;
@@ -1111,21 +1124,21 @@ export function buildHeroModel(
     bodyRoot.add(legPivot);
     return legPivot;
   };
-  const legL = makeLeg(-0.15);
-  const legR = makeLeg(0.15);
+  const legL = makeLeg(-0.15, 'LeftUpperLeg');
+  const legR = makeLeg(0.15, 'RightUpperLeg');
 
   // Torso
   const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.22, 0.58, 12), tunicMat);
   torso.position.y = 0.82;
   torso.castShadow = true;
-  bodyRoot.add(torso);
+  upperBodyRoot.add(torso);
 
   // Belt
   const belt = new THREE.Mesh(new THREE.CylinderGeometry(0.245, 0.245, 0.09, 12), bootMat);
   belt.position.y = 0.62;
   const buckle = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.1, 0.06), goldMat);
   buckle.position.set(0, 0.62, 0.23);
-  bodyRoot.add(belt, buckle);
+  upperBodyRoot.add(belt, buckle);
 
   // Cloak / backpack
   if (heroBody === 'Adventurer' || heroBody === 'Wizard' || heroBody === 'Knight') {
@@ -1133,23 +1146,25 @@ export function buildHeroModel(
     cape.position.set(0, 0.8, -0.23);
     cape.rotation.x = 0.14;
     cape.castShadow = true;
-    bodyRoot.add(cape);
+    upperBodyRoot.add(cape);
   } else if (heroBody === 'Explorer') {
     const pack = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.42, 0.22), bootMat);
     pack.position.set(0, 0.86, -0.26);
     pack.castShadow = true;
-    bodyRoot.add(pack);
+    upperBodyRoot.add(pack);
   }
 
   // Arms with articulated elbow joints (+X is anatomical Left, -X is anatomical Right when facing +Z)
-  const makeArm = (x: number) => {
+  const makeArm = (x: number, upperName: string, lowerName: string) => {
     const pivot = new THREE.Group();
+    pivot.name = upperName;
     pivot.position.set(x, 1.04, 0);
     const upperSleeve = new THREE.Mesh(new THREE.CapsuleGeometry(0.085, 0.11, 6, 10), tunicMat);
     upperSleeve.position.y = -0.095;
     upperSleeve.castShadow = true;
 
     const forearm = new THREE.Group();
+    forearm.name = lowerName;
     forearm.position.set(0, -0.19, 0);
     const lowerSleeve = new THREE.Mesh(new THREE.CapsuleGeometry(0.078, 0.1, 6, 10), tunicMat);
     lowerSleeve.position.y = -0.09;
@@ -1164,11 +1179,11 @@ export function buildHeroModel(
     forearm.add(lowerSleeve, hand, handGrip);
     pivot.add(upperSleeve, forearm);
     pivot.userData.forearm = forearm;
-    bodyRoot.add(pivot);
+    upperBodyRoot.add(pivot);
     return { pivot, forearm, handGrip };
   };
-  const { pivot: armL, forearm: forearmL, handGrip: handGripL } = makeArm(0.34);
-  const { pivot: armR, forearm: forearmR, handGrip: handGripR } = makeArm(-0.34);
+  const { pivot: armL, forearm: forearmL, handGrip: handGripL } = makeArm(0.34, 'LeftUpperArm', 'LeftLowerArm');
+  const { pivot: armR, forearm: forearmR, handGrip: handGripR } = makeArm(-0.34, 'RightUpperArm', 'RightLowerArm');
 
   // Sword on right forearm
   const sword = new THREE.Group();
@@ -1257,10 +1272,24 @@ export function buildHeroModel(
   heldGeneric.visible = false;
   forearmR.add(heldGeneric);
 
-  // Shield on left forearm
-  const shield = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.22, 0.06, 12), cloakMat);
-  shield.rotation.z = Math.PI / 2;
-  shield.position.set(0.08, -0.05, 0.08);
+  // Sculpted Off-Hand Shield on left forearm (tinted by equipped offhand shield item)
+  const shield = new THREE.Group();
+  shield.position.set(0.11, -0.06, 0.06);
+  shield.rotation.set(0.04, -0.22, 0);
+  const shieldFaceMat = new THREE.MeshStandardMaterial({ color: '#B47634', roughness: 0.62, flatShading: true });
+  const shieldRimMat = new THREE.MeshStandardMaterial({ color: '#94A3B8', roughness: 0.35, metalness: 0.52 });
+  const shieldBoard = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.22, 0.05, 8), shieldFaceMat);
+  shieldBoard.rotation.z = Math.PI / 2;
+  shieldBoard.scale.set(1.16, 1, 0.92);
+  shieldBoard.castShadow = true;
+  const shieldRim = new THREE.Mesh(new THREE.TorusGeometry(0.245, 0.025, 6, 12), shieldRimMat);
+  shieldRim.rotation.y = Math.PI / 2;
+  shieldRim.scale.set(0.92, 1.12, 1);
+  const shieldBoss = new THREE.Mesh(new THREE.SphereGeometry(0.065, 8, 6), shieldRimMat);
+  shieldBoss.position.set(0.032, 0, 0);
+  shieldBoss.scale.set(0.55, 1, 1);
+  shield.userData.tintMeshes = [shieldBoard];
+  shield.add(shieldBoard, shieldRim, shieldBoss);
   forearmL.add(shield);
 
   // Wearable Body Cloak (visible when equipping a wearable body cloak item)
@@ -1289,10 +1318,11 @@ export function buildHeroModel(
   amuletGem.position.z = 0.015;
   wearAccessoryAmulet.userData.tintMeshes = [amuletGem];
   wearAccessoryAmulet.add(amuletRing, amuletGem);
-  bodyRoot.add(wearAccessoryAmulet);
+  upperBodyRoot.add(wearAccessoryAmulet);
 
   // Head
   const head = new THREE.Group();
+  head.name = 'Head';
   head.position.set(0, 1.36, 0);
   const cranium = new THREE.Mesh(
     heroBody === 'Robot' ? new THREE.BoxGeometry(0.42, 0.38, 0.4) : new THREE.SphereGeometry(0.25, 14, 14),
@@ -1393,13 +1423,18 @@ export function buildHeroModel(
   head.add(wearHeadCrown);
 
   if (creatureType) {
-    attachCreatureParts(creatureType, bodyRoot, head, armL, armR, group);
+    attachCreatureParts(creatureType, upperBodyRoot, head, armL, armR, group);
+    const cAnim = group.userData.creatureAnim as CreatureAnimRefs | undefined;
+    if (cAnim?.tail) cAnim.tail.name = 'Tail';
+    if (cAnim?.wingL) cAnim.wingL.name = 'LeftWing';
+    if (cAnim?.wingR) cAnim.wingR.name = 'RightWing';
   }
 
-  bodyRoot.add(head);
-  return {
+  upperBodyRoot.add(head);
+  const heroRigOut: HeroRig = {
     group,
     bodyPivot,
+    spinePivot,
     shadowDisc,
     head,
     torso,
@@ -1423,6 +1458,308 @@ export function buildHeroModel(
     wearBodyCloak,
     wearAccessoryAmulet,
   };
+  group.userData.heroRig = heroRigOut;
+  return heroRigOut;
+}
+
+/**
+ * Builds an articulated Townsperson NPC rig (classic scarf, brimmed cap, robe/tunic silhouette)
+ * with full shoulder, elbow, waist, head, and foot joints so NPCs can wave, talk, emote, and animate cleanly.
+ */
+export function buildProceduralNpcRig(styleTint?: string): HeroRig {
+  const group = new THREE.Group();
+  group.name = 'ProceduralNpcRoot';
+
+  const robeColor = styleTint || '#3AA0FF';
+  const robeMat = new THREE.MeshStandardMaterial({ color: robeColor, roughness: 0.65 });
+  const skinMat = new THREE.MeshStandardMaterial({ color: '#F3C7A4', roughness: 0.65 });
+  const hatMat = new THREE.MeshStandardMaterial({ color: '#FF9F1C', roughness: 0.6 });
+  const bootMat = new THREE.MeshStandardMaterial({ color: '#3E2B22', roughness: 0.8 });
+
+  const shadowDisc = new THREE.Mesh(
+    new THREE.CircleGeometry(0.45, 20),
+    new THREE.MeshBasicMaterial({ color: '#000000', transparent: true, opacity: 0.25, depthWrite: false })
+  );
+  shadowDisc.rotation.x = -Math.PI / 2;
+  shadowDisc.position.y = 0.02;
+  group.add(shadowDisc);
+
+  const bodyPivot = new THREE.Group();
+  bodyPivot.name = 'Hips';
+  bodyPivot.position.set(0, 0.72, 0);
+  const bodyRoot = new THREE.Group();
+  bodyRoot.position.set(0, -0.72, 0);
+  bodyPivot.add(bodyRoot);
+  group.add(bodyPivot);
+
+  const skirt = new THREE.Mesh(new THREE.ConeGeometry(0.34, 0.66, 12), robeMat);
+  skirt.position.y = 0.36;
+  skirt.castShadow = true;
+  bodyRoot.add(skirt);
+
+  const makeFoot = (x: number, name: string) => {
+    const legPivot = new THREE.Group();
+    legPivot.name = name;
+    legPivot.position.set(x, 0.32, 0);
+    const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.11, 0.24), bootMat);
+    shoe.position.set(0, -0.26, 0.05);
+    shoe.castShadow = true;
+    legPivot.add(shoe);
+    bodyRoot.add(legPivot);
+    return legPivot;
+  };
+  const legL = makeFoot(-0.12, 'LeftUpperLeg');
+  const legR = makeFoot(0.12, 'RightUpperLeg');
+
+  const spinePivot = new THREE.Group();
+  spinePivot.name = 'Spine';
+  spinePivot.position.set(0, 0.62, 0);
+  const upperBody = new THREE.Group();
+  upperBody.position.set(0, -0.62, 0);
+  spinePivot.add(upperBody);
+  bodyRoot.add(spinePivot);
+
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.26, 0.45, 12), robeMat);
+  torso.position.y = 0.84;
+  torso.castShadow = true;
+  const scarf = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.06, 8, 16), hatMat);
+  scarf.rotation.x = Math.PI / 2;
+  scarf.position.y = 1.07;
+  upperBody.add(torso, scarf);
+
+  const makeArm = (x: number, upperName: string, lowerName: string) => {
+    const pivot = new THREE.Group();
+    pivot.name = upperName;
+    pivot.position.set(x, 0.99, 0);
+    const upperSleeve = new THREE.Mesh(new THREE.CapsuleGeometry(0.072, 0.1, 6, 8), robeMat);
+    upperSleeve.position.y = -0.09;
+    upperSleeve.castShadow = true;
+
+    const forearm = new THREE.Group();
+    forearm.name = lowerName;
+    forearm.position.set(0, -0.17, 0);
+    const lowerSleeve = new THREE.Mesh(new THREE.CapsuleGeometry(0.065, 0.09, 6, 8), robeMat);
+    lowerSleeve.position.y = -0.08;
+    lowerSleeve.castShadow = true;
+    const hand = new THREE.Mesh(new THREE.SphereGeometry(0.075, 10, 10), skinMat);
+    hand.position.y = -0.16;
+    const handGrip = new THREE.Object3D();
+    handGrip.position.set(0, -0.16, 0.02);
+    forearm.add(lowerSleeve, hand, handGrip);
+    pivot.add(upperSleeve, forearm);
+    upperBody.add(pivot);
+    return { pivot, forearm, handGrip };
+  };
+  const { pivot: armL, forearm: forearmL, handGrip: handGripL } = makeArm(0.29, 'LeftUpperArm', 'LeftLowerArm');
+  const { pivot: armR, forearm: forearmR, handGrip: handGripR } = makeArm(-0.29, 'RightUpperArm', 'RightLowerArm');
+
+  const head = new THREE.Group();
+  head.name = 'Head';
+  head.position.set(0, 1.28, 0);
+  const headSphere = new THREE.Mesh(new THREE.SphereGeometry(0.23, 14, 14), skinMat);
+  headSphere.castShadow = true;
+  const eyeMat = new THREE.MeshStandardMaterial({ color: '#1C1C1E', roughness: 0.3 });
+  const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.032, 8, 8), eyeMat);
+  eyeL.position.set(-0.075, 0.02, 0.2);
+  const eyeR = eyeL.clone();
+  eyeR.position.x = 0.075;
+  const hat = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.32, 0.18, 12), hatMat);
+  hat.position.y = 0.2;
+  hat.castShadow = true;
+  head.add(headSphere, eyeL, eyeR, hat);
+  upperBody.add(head);
+
+  const npcRig: HeroRig = {
+    group,
+    bodyPivot,
+    spinePivot,
+    shadowDisc,
+    head,
+    torso,
+    armL,
+    armR,
+    forearmL,
+    forearmR,
+    handGripL,
+    handGripR,
+    legL,
+    legR,
+  };
+  group.userData.heroRig = npcRig;
+  group.userData.npcRig = npcRig;
+  return npcRig;
+}
+
+/**
+ * Builds an articulated procedural Baddie model (Ground Fighter, Winged Flyer, or Boss Warlord)
+ * with canonical bone/pivot names so it can be posed & keyframe-animated in Motion Studio and Play Mode.
+ */
+export function buildProceduralBaddieModel(
+  variant: 'ground' | 'flyer' | 'boss' = 'ground',
+  styleTint?: string
+): { group: THREE.Group; rig: BaddieRig } {
+  const group = new THREE.Group();
+  group.name = `ProceduralBaddie_${variant}`;
+  const isBoss = variant === 'boss';
+  const isFlyer = variant === 'flyer';
+
+  const shadow = new THREE.Mesh(
+    new THREE.CircleGeometry(isBoss ? 0.9 : 0.55, 18),
+    new THREE.MeshBasicMaterial({ color: '#000000', transparent: true, opacity: 0.25, depthWrite: false })
+  );
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.y = 0.02;
+  group.add(shadow);
+
+  const bodyColor = styleTint || (isBoss ? '#9B2242' : isFlyer ? '#524175' : '#D9434E');
+  const armorColor = isBoss ? '#F2C230' : '#32323D';
+  const bodyMat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.55, flatShading: true });
+  const darkMat = new THREE.MeshStandardMaterial({ color: armorColor, roughness: 0.42, metalness: 0.45, flatShading: true });
+  const bladeMat = new THREE.MeshStandardMaterial({ color: '#D6DEE8', roughness: 0.25, metalness: 0.85, flatShading: true });
+
+  const slashGeo = new THREE.RingGeometry(0.55, 1.32, 16, 1, -0.95, 1.9);
+  slashGeo.rotateX(-Math.PI / 2);
+  const slashMat = new THREE.MeshBasicMaterial({
+    color: '#FF5E3A',
+    transparent: true,
+    opacity: 0,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const slashArc = new THREE.Mesh(slashGeo, slashMat);
+  slashArc.visible = false;
+
+  if (isFlyer) {
+    const bodyPivot = new THREE.Group();
+    bodyPivot.name = 'Hips';
+    bodyPivot.position.y = 1.25;
+
+    const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.36, 1), bodyMat);
+    core.castShadow = true;
+
+    const wingGeo = new THREE.BoxGeometry(0.75, 0.06, 0.36);
+    const wingL = new THREE.Group();
+    wingL.name = 'LeftWing';
+    wingL.position.set(-0.26, 0.07, 0);
+    const wingLMesh = new THREE.Mesh(wingGeo, darkMat);
+    wingLMesh.position.x = -0.34;
+    wingLMesh.castShadow = true;
+    wingL.add(wingLMesh);
+
+    const wingR = new THREE.Group();
+    wingR.name = 'RightWing';
+    wingR.position.set(0.26, 0.07, 0);
+    const wingRMesh = new THREE.Mesh(wingGeo, darkMat);
+    wingRMesh.position.x = 0.34;
+    wingRMesh.castShadow = true;
+    wingR.add(wingRMesh);
+
+    const eyeMat = new THREE.MeshStandardMaterial({ color: '#FFE066', emissive: '#FF9F1C', emissiveIntensity: 0.8 });
+    const eyeL = new THREE.Mesh(new THREE.OctahedronGeometry(0.06, 0), eyeMat);
+    eyeL.position.set(-0.13, 0.05, 0.31);
+    const eyeR = eyeL.clone();
+    eyeR.position.x = 0.13;
+
+    slashArc.position.set(0, -0.08, 0.45);
+    bodyPivot.add(core, wingL, wingR, eyeL, eyeR, slashArc);
+    group.add(bodyPivot);
+
+    const rig: BaddieRig = {
+      isFlyer: true,
+      bodyPivot,
+      wingL,
+      wingR,
+      slashArc,
+      slashMat,
+      flashMaterials: [bodyMat, darkMat],
+    };
+    group.userData.baddieRig = rig;
+    return { group, rig };
+  }
+
+  const scale = isBoss ? 1.45 : 1.0;
+  const bodyPivot = new THREE.Group();
+  bodyPivot.name = 'Hips';
+  bodyPivot.scale.setScalar(scale);
+
+  const legs = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.28, 0.42, 7), darkMat);
+  legs.position.y = 0.21;
+  legs.castShadow = true;
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.56, 0.44), bodyMat);
+  torso.name = 'Spine';
+  torso.position.y = 0.7;
+  torso.castShadow = true;
+
+  const headGroup = new THREE.Group();
+  headGroup.name = 'Head';
+  headGroup.position.set(0, 1.18, 0);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.38, 0.4), bodyMat);
+  head.castShadow = true;
+  const brow = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.1, 0.44), darkMat);
+  brow.position.y = 0.16;
+  const eyeMat = new THREE.MeshStandardMaterial({ color: '#FFF', emissive: '#FF4D4D', emissiveIntensity: 0.7 });
+  const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.05, 0.04), eyeMat);
+  eyeL.position.set(-0.1, 0, 0.2);
+  const eyeR = eyeL.clone();
+  eyeR.position.x = 0.1;
+  headGroup.add(head, brow, eyeL, eyeR);
+
+  if (isBoss) {
+    const crown = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.24, 0.18, 0.18, 6),
+      new THREE.MeshStandardMaterial({ color: '#F2C230', metalness: 0.85, roughness: 0.25, flatShading: true })
+    );
+    crown.position.y = 0.3;
+    headGroup.add(crown);
+  }
+
+  const armL = new THREE.Group();
+  armL.name = 'LeftUpperArm';
+  armL.position.set(-0.35, 0.88, 0);
+  const armLMesh = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.38, 0.15), bodyMat);
+  armLMesh.position.y = -0.16;
+  armLMesh.castShadow = true;
+  const bracer = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.14, 0.22), darkMat);
+  bracer.position.set(-0.02, -0.28, 0.04);
+  armL.add(armLMesh, bracer);
+
+  const armR = new THREE.Group();
+  armR.name = 'RightUpperArm';
+  armR.position.set(0.35, 0.9, 0);
+  const armRMesh = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.38, 0.15), bodyMat);
+  armRMesh.position.y = -0.16;
+  armRMesh.castShadow = true;
+
+  const weapon = new THREE.Group();
+  weapon.position.set(0.04, -0.32, 0.06);
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.036, 1.38, 6), darkMat);
+  shaft.position.set(0, 0.26, 0.12);
+  shaft.rotation.x = 0.32;
+  shaft.castShadow = true;
+  const spearTip = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.36, 5), bladeMat);
+  spearTip.position.set(0, 0.96, 0.35);
+  spearTip.rotation.x = 0.32;
+  spearTip.castShadow = true;
+  weapon.add(shaft, spearTip);
+  armR.add(armRMesh, weapon);
+
+  slashArc.position.set(0, 0.88, 0.32);
+  bodyPivot.add(legs, torso, headGroup, armL, armR, slashArc);
+  group.add(bodyPivot);
+
+  const rig: BaddieRig = {
+    isFlyer: false,
+    bodyPivot,
+    armR,
+    armL,
+    head: headGroup,
+    slashArc,
+    slashMat,
+    flashMaterials: [bodyMat, darkMat],
+  };
+  group.userData.baddieRig = rig;
+  return { group, rig };
 }
 
 export function buildPickupItemMesh(meshKind: PickupMeshKind, colorHex: string): THREE.Group {
@@ -1697,6 +2034,20 @@ export function buildPickupItemMesh(meshKind: PickupMeshKind, colorHex: string):
       const pauldronR = pauldronL.clone();
       pauldronR.position.x = 0.24;
       holder.add(breast, trim, pauldronL, pauldronR);
+      break;
+    }
+    case 'shield': {
+      const faceMat = new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.6, flatShading: true });
+      const board = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.25, 0.06, 8), faceMat);
+      board.rotation.x = Math.PI / 2;
+      board.scale.set(0.92, 1, 1.15);
+      board.castShadow = true;
+      const rim = new THREE.Mesh(new THREE.TorusGeometry(0.29, 0.03, 6, 12), steelMat);
+      rim.scale.set(0.92, 1.12, 1);
+      const boss = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 6), goldMat);
+      boss.position.z = 0.035;
+      boss.scale.set(1, 1, 0.55);
+      holder.add(board, rim, boss);
       break;
     }
     case 'staff': {
@@ -2218,150 +2569,10 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
 
   switch (entity.kind) {
     case 'baddie': {
-      addShadow(entity.isBoss ? 0.9 : 0.55);
-      const isFlyer = entity.brain === 'Flyer';
-      const bodyColor = entity.isBoss ? '#9B2242' : isFlyer ? '#524175' : '#D9434E';
-      const armorColor = entity.isBoss ? '#F2C230' : '#32323D';
-      const bodyMat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.55, flatShading: true });
-      const darkMat = new THREE.MeshStandardMaterial({ color: armorColor, roughness: 0.42, metalness: 0.45, flatShading: true });
-      const bladeMat = new THREE.MeshStandardMaterial({ color: '#D6DEE8', roughness: 0.25, metalness: 0.85, flatShading: true });
-
-      // Enemy strike slash arc (hidden unless swinging/lunging)
-      const slashGeo = new THREE.RingGeometry(0.55, 1.32, 16, 1, -0.95, 1.9);
-      slashGeo.rotateX(-Math.PI / 2);
-      const slashMat = new THREE.MeshBasicMaterial({
-        color: '#FF5E3A',
-        transparent: true,
-        opacity: 0,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      });
-      const slashArc = new THREE.Mesh(slashGeo, slashMat);
-      slashArc.visible = false;
-
-      if (isFlyer) {
-        const bodyPivot = new THREE.Group();
-        bodyPivot.position.y = 1.25;
-
-        const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.36, 1), bodyMat);
-        core.castShadow = true;
-
-        const wingGeo = new THREE.BoxGeometry(0.75, 0.06, 0.36);
-        const wingL = new THREE.Group();
-        wingL.position.set(-0.26, 0.07, 0);
-        const wingLMesh = new THREE.Mesh(wingGeo, darkMat);
-        wingLMesh.position.x = -0.34;
-        wingLMesh.castShadow = true;
-        wingL.add(wingLMesh);
-
-        const wingR = new THREE.Group();
-        wingR.position.set(0.26, 0.07, 0);
-        const wingRMesh = new THREE.Mesh(wingGeo, darkMat);
-        wingRMesh.position.x = 0.34;
-        wingRMesh.castShadow = true;
-        wingR.add(wingRMesh);
-
-        const eyeMat = new THREE.MeshStandardMaterial({ color: '#FFE066', emissive: '#FF9F1C', emissiveIntensity: 0.8 });
-        const eyeL = new THREE.Mesh(new THREE.OctahedronGeometry(0.06, 0), eyeMat);
-        eyeL.position.set(-0.13, 0.05, 0.31);
-        const eyeR = eyeL.clone();
-        eyeR.position.x = 0.13;
-
-        slashArc.position.set(0, -0.08, 0.45);
-        bodyPivot.add(core, wingL, wingR, eyeL, eyeR, slashArc);
-        group.add(bodyPivot);
-
-        const rig: BaddieRig = {
-          isFlyer: true,
-          bodyPivot,
-          wingL,
-          wingR,
-          slashArc,
-          slashMat,
-          flashMaterials: [bodyMat, darkMat],
-        };
-        group.userData.baddieRig = rig;
-      } else {
-        const scale = entity.isBoss ? 1.45 : 1.0;
-        const bodyPivot = new THREE.Group();
-        bodyPivot.scale.setScalar(scale);
-
-        const legs = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.28, 0.42, 7), darkMat);
-        legs.position.y = 0.21;
-        legs.castShadow = true;
-
-        const torso = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.56, 0.44), bodyMat);
-        torso.position.y = 0.7;
-        torso.castShadow = true;
-
-        const headGroup = new THREE.Group();
-        headGroup.position.set(0, 1.18, 0);
-        const head = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.38, 0.4), bodyMat);
-        head.castShadow = true;
-        const brow = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.1, 0.44), darkMat);
-        brow.position.y = 0.16;
-        const eyeMat = new THREE.MeshStandardMaterial({ color: '#FFF', emissive: '#FF4D4D', emissiveIntensity: 0.7 });
-        const eyeL = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.05, 0.04), eyeMat);
-        eyeL.position.set(-0.1, 0, 0.2);
-        const eyeR = eyeL.clone();
-        eyeR.position.x = 0.1;
-        headGroup.add(head, brow, eyeL, eyeR);
-
-        if (entity.isBoss) {
-          const crown = new THREE.Mesh(
-            new THREE.CylinderGeometry(0.24, 0.18, 0.18, 6),
-            new THREE.MeshStandardMaterial({ color: '#F2C230', metalness: 0.85, roughness: 0.25, flatShading: true })
-          );
-          crown.position.y = 0.3;
-          headGroup.add(crown);
-        }
-
-        // Left arm with small bracer
-        const armL = new THREE.Group();
-        armL.position.set(-0.35, 0.88, 0);
-        const armLMesh = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.38, 0.15), bodyMat);
-        armLMesh.position.y = -0.16;
-        armLMesh.castShadow = true;
-        const bracer = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.14, 0.22), darkMat);
-        bracer.position.set(-0.02, -0.28, 0.04);
-        armL.add(armLMesh, bracer);
-
-        // Right weapon arm holding a faceted spear/halberd
-        const armR = new THREE.Group();
-        armR.position.set(0.35, 0.9, 0);
-        const armRMesh = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.38, 0.15), bodyMat);
-        armRMesh.position.y = -0.16;
-        armRMesh.castShadow = true;
-
-        const weapon = new THREE.Group();
-        weapon.position.set(0.04, -0.32, 0.06);
-        const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.036, 1.38, 6), darkMat);
-        shaft.position.set(0, 0.26, 0.12);
-        shaft.rotation.x = 0.32;
-        shaft.castShadow = true;
-        const spearTip = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.36, 5), bladeMat);
-        spearTip.position.set(0, 0.96, 0.35);
-        spearTip.rotation.x = 0.32;
-        spearTip.castShadow = true;
-        weapon.add(shaft, spearTip);
-        armR.add(armRMesh, weapon);
-
-        slashArc.position.set(0, 0.88, 0.32);
-        bodyPivot.add(legs, torso, headGroup, armL, armR, slashArc);
-        group.add(bodyPivot);
-
-        const rig: BaddieRig = {
-          isFlyer: false,
-          bodyPivot,
-          armR,
-          armL,
-          head: headGroup,
-          slashArc,
-          slashMat,
-          flashMaterials: [bodyMat, darkMat],
-        };
-        group.userData.baddieRig = rig;
-      }
+      const variant = entity.brain === 'Flyer' ? 'flyer' : entity.isBoss ? 'boss' : 'ground';
+      const built = buildProceduralBaddieModel(variant, entity.styleTint);
+      group.add(built.group);
+      group.userData.baddieRig = built.rig;
       break;
     }
 
@@ -2373,26 +2584,15 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
         if (creatureMesh.userData.creatureAnim) {
           group.userData.creatureAnim = creatureMesh.userData.creatureAnim;
         }
+        if (creatureMesh.userData.heroRig) {
+          group.userData.heroRig = creatureMesh.userData.heroRig;
+        }
         break;
       }
-      addShadow(0.45);
-      const robeMat = new THREE.MeshStandardMaterial({ color: '#3AA0FF', roughness: 0.65 });
-      const skinMat = new THREE.MeshStandardMaterial({ color: '#F3C7A4', roughness: 0.65 });
-      const hatMat = new THREE.MeshStandardMaterial({ color: '#FF9F1C', roughness: 0.6 });
-      const skirt = new THREE.Mesh(new THREE.ConeGeometry(0.34, 0.75, 12), robeMat);
-      skirt.position.y = 0.38;
-      skirt.castShadow = true;
-      const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.26, 0.45, 12), robeMat);
-      torso.position.y = 0.84;
-      const head = new THREE.Mesh(new THREE.SphereGeometry(0.23, 14, 14), skinMat);
-      head.position.y = 1.28;
-      head.castShadow = true;
-      const hat = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.32, 0.18, 12), hatMat);
-      hat.position.y = 1.48;
-      const scarf = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.06, 8, 16), hatMat);
-      scarf.rotation.x = Math.PI / 2;
-      scarf.position.y = 1.07;
-      group.add(skirt, torso, head, hat, scarf);
+      const npcRig = buildProceduralNpcRig(entity.styleTint);
+      group.add(npcRig.group);
+      group.userData.heroRig = npcRig;
+      group.userData.npcRig = npcRig;
       break;
     }
 

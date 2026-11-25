@@ -11,6 +11,7 @@ import {
   MisfitAbilityCatalog,
   PresetLibrary,
 } from '../../data/registries';
+import { resolveHeroProfile } from '../../data/heroTraits';
 import type { MakerStore } from '../../store/useMakerStore';
 import type {
   CreatureBodyId,
@@ -32,6 +33,7 @@ import { MakerIcon } from '../shared/IconMap';
 import { EmptyHint, FieldLabel, MakerCard } from '../shared/MakerUI';
 import { VertexPaintModal } from '../world/VertexPaintModal';
 import { CastScaleViewport3D } from './CastScaleViewport3D';
+import { HeroInspector } from './HeroInspector';
 
 export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
   const { currentProject, currentLevel, currentEntity, selectedSection, setSelectedSection } = store;
@@ -52,6 +54,8 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
   const heroCustomAsset = currentProject.heroCustomAssetId
     ? store.customAssets.find((a) => a.id === currentProject.heroCustomAssetId)
     : null;
+  const heroProfile = resolveHeroProfile(currentProject);
+  const heroSelected = focusedTarget === 'hero' || !currentEntity;
 
   return (
     <div className="h-full min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden maker-scroll">
@@ -71,7 +75,8 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
 
         <div className="grid grid-cols-3 lg:grid-cols-2 gap-2">
           {EntitySectionMeta.map((sec) => {
-            const count = currentLevel.entities.filter((e) => EntityKindMeta[e.kind].section === sec.id).length;
+            const rawCount = currentLevel.entities.filter((e) => EntityKindMeta[e.kind].section === sec.id).length;
+            const count = sec.id === 'cast' ? rawCount + 1 : rawCount;
             const active = selectedSection === sec.id;
             return (
               <button
@@ -79,9 +84,14 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 type="button"
                 onClick={() => {
                   setSelectedSection(sec.id);
-                  const first = currentLevel.entities.find((e) => EntityKindMeta[e.kind].section === sec.id);
-                  store.setSelectedEntityID(first?.id ?? null);
-                  setFocusedTarget(first ? 'entity' : 'hero');
+                  if (sec.id === 'cast') {
+                    store.setSelectedEntityID(null);
+                    setFocusedTarget('hero');
+                  } else {
+                    const first = currentLevel.entities.find((e) => EntityKindMeta[e.kind].section === sec.id);
+                    store.setSelectedEntityID(first?.id ?? null);
+                    setFocusedTarget(first ? 'entity' : 'hero');
+                  }
                 }}
                 className={`p-2.5 rounded-2xl text-center border transition-all ${
                   active
@@ -103,12 +113,45 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           <div className="text-xs font-extrabold">
             {EntitySectionMeta.find((s) => s.id === selectedSection)?.title}
           </div>
-          {sectionEntities.length === 0 ? (
+
+          {selectedSection === 'cast' && (
+            <button
+              type="button"
+              onClick={() => {
+                store.setSelectedEntityID(null);
+                setFocusedTarget('hero');
+              }}
+              className={`w-full flex items-center gap-2.5 p-2 rounded-xl border text-left transition-colors ${
+                heroSelected
+                  ? 'bg-[#7C5CFF]/15 border-[#7C5CFF]/60'
+                  : 'border-transparent hover:bg-slate-100 dark:hover:bg-[#1F2430]'
+              }`}
+            >
+              <AssetThumbnail
+                customAsset={heroCustomAsset}
+                hero={{
+                  body: currentProject.heroBody,
+                  colors: currentProject.heroColors,
+                }}
+                size={36}
+                rounded="rounded-lg"
+                alt={currentProject.heroName}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-extrabold truncate">{currentProject.heroName}</div>
+                <div className="text-[11px] text-slate-500 dark:text-[#949BB0] truncate tabular-nums">
+                  Hero · {heroProfile.stats.maxHealth} HP · {heroProfile.skills.length} skills
+                </div>
+              </div>
+            </button>
+          )}
+
+          {sectionEntities.length === 0 && selectedSection !== 'cast' ? (
             <p className="text-xs text-slate-500 dark:text-[#949BB0]">Nothing here yet.</p>
           ) : (
             sectionEntities.map((ent) => {
               const meta = EntityKindMeta[ent.kind];
-              const selected = ent.id === store.selectedEntityID;
+              const selected = !heroSelected && ent.id === store.selectedEntityID;
               const entCustom = ent.customAssetId
                 ? store.customAssets.find((a) => a.id === ent.customAssetId) ?? null
                 : null;
@@ -188,7 +231,12 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             customAssets={store.customAssets}
             focusedTarget={focusedTarget}
             selectedEntity={currentEntity}
-            onSelectTarget={setFocusedTarget}
+            onSelectTarget={(next) => {
+              setFocusedTarget(next);
+              if (next === 'hero') {
+                store.setSelectedEntityID(null);
+              }
+            }}
           />
 
           {/* Quick World Scale Control linked directly to focused 3D character */}
@@ -256,12 +304,15 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         {/* Hero Card */}
         <MakerCard
           className={`space-y-4 ${
-            focusedTarget === 'hero' ? 'ring-2 ring-[#7C5CFF]/35 border-[#7C5CFF]/60' : ''
+            heroSelected ? 'ring-2 ring-[#7C5CFF]/35 border-[#7C5CFF]/60' : ''
           }`}
         >
           <div
             className="flex flex-wrap items-center gap-4 cursor-pointer"
-            onClick={() => setFocusedTarget('hero')}
+            onClick={() => {
+              store.setSelectedEntityID(null);
+              setFocusedTarget('hero');
+            }}
           >
             <AssetThumbnail
               customAsset={heroCustomAsset}
@@ -613,9 +664,9 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
         </div>
       </main>
 
-      {/* Right Inspector: Selected Entity Editor */}
-      <aside className="w-full lg:w-80 shrink-0 lg:h-full lg:min-h-0 bg-white dark:bg-[#171A23] border-t lg:border-t-0 lg:border-l border-slate-200/80 dark:border-white/[0.08] lg:overflow-y-auto maker-scroll p-4 space-y-4">
-        {currentEntity ? (
+      {/* Right Inspector: Contextual Hero or Selected Entity Editor */}
+      <aside className="w-full lg:w-[360px] shrink-0 lg:h-full lg:min-h-0 bg-white dark:bg-[#171A23] border-t lg:border-t-0 lg:border-l border-slate-200/80 dark:border-white/[0.08] lg:overflow-y-auto maker-scroll p-4 space-y-4">
+        {!heroSelected && currentEntity ? (
           <EntityInspector
             entity={currentEntity}
             store={store}
@@ -625,9 +676,12 @@ export const CastStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             }
           />
         ) : (
-          <div className="text-xs text-slate-500 dark:text-[#949BB0] py-6 text-center">
-            Pick anything on the left to change its 3D model, stats, dialogue, or rules.
-          </div>
+          <HeroInspector
+            store={store}
+            onOpenChatStudio={(tab = 'bubble') =>
+              setChatStudioState({ target: 'hero', tab })
+            }
+          />
         )}
       </aside>
 

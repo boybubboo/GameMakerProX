@@ -63,7 +63,7 @@ interface InventoryModalProps {
   onSelectItem?: (itemId: string) => void;
   onHoldItem: (itemId: string | null) => void;
   onWearItem: (item: InventoryItemDef) => void;
-  onUnequipSlot: (slot: 'head' | 'body' | 'accessory') => void;
+  onUnequipSlot: (slot: 'head' | 'body' | 'accessory' | 'offhand') => void;
   onConsumeItem: (item: InventoryItemDef) => void;
   onMixItems: (itemIdA: string, itemIdB: string) => void;
   onCraftRecipe?: (recipe: CraftingRecipe) => void;
@@ -398,13 +398,20 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
     if (!def.wearSlot) return false;
     if (def.wearSlot === 'head') return equipment.headItemId === def.id;
     if (def.wearSlot === 'body') return equipment.bodyItemId === def.id;
+    if (def.wearSlot === 'offhand') return equipment.offhandItemId === def.id;
     return equipment.accessoryItemId === def.id;
   };
 
   const heldDef = equipment.heldItemId ? itemById.get(equipment.heldItemId) : null;
+  const offhandDef = equipment.offhandItemId ? itemById.get(equipment.offhandItemId) : null;
   const headDef = equipment.headItemId ? itemById.get(equipment.headItemId) : null;
   const bodyDef = equipment.bodyItemId ? itemById.get(equipment.bodyItemId) : null;
   const accDef = equipment.accessoryItemId ? itemById.get(equipment.accessoryItemId) : null;
+  const twoHandedStowsShield =
+    Boolean(offhandDef) &&
+    (heldDef?.handedness === 'twoHand' ||
+      heldDef?.toolKind === 'axe' ||
+      heldDef?.toolKind === 'fishingPole');
 
   const resolvedTitle = cfg.panelTitle.replace('{heroName}', heroName);
   const toggleKeyLabel = formatKeyCodeLabel(cfg.toggleKey);
@@ -498,10 +505,11 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
         </header>
 
         {/* Equipped Loadout Strip */}
-        <div className="px-5 py-2.5 border-b border-white/8 bg-[#141926] grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="px-5 py-2.5 border-b border-white/8 bg-[#141926] grid grid-cols-2 sm:grid-cols-5 gap-2">
           {(
             [
-              { label: 'Holding', def: heldDef, onClear: () => onHoldItem(null) },
+              { label: 'Main Hand', def: heldDef, onClear: () => onHoldItem(null) },
+              { label: 'Off-Hand', def: offhandDef, onClear: () => onUnequipSlot('offhand') },
               { label: 'Head', def: headDef, onClear: () => onUnequipSlot('head') },
               { label: 'Body', def: bodyDef, onClear: () => onUnequipSlot('body') },
               { label: 'Accessory', def: accDef, onClear: () => onUnequipSlot('accessory') },
@@ -522,8 +530,14 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                     stack: stacks.find((s) => s.itemId === def.id) ?? null,
                     x: e.clientX,
                     y: e.clientY,
-                    statusTag: label,
-                    hint: 'Equipped · Click to inspect or Off to unequip',
+                    statusTag:
+                      label === 'Off-Hand' && twoHandedStowsShield ? 'Stowed (2H)' : label,
+                    hint:
+                      label === 'Off-Hand'
+                        ? twoHandedStowsShield
+                          ? 'Equip a 1-handed weapon to raise your shield with Use'
+                          : 'Hold Use (E/Alt) in battle to block'
+                        : 'Equipped · Click to inspect or Off to unequip',
                   });
                 }}
                 onMouseMove={(e) => {
@@ -533,8 +547,14 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                     stack: stacks.find((s) => s.itemId === def.id) ?? null,
                     x: e.clientX,
                     y: e.clientY,
-                    statusTag: label,
-                    hint: 'Equipped · Click to inspect or Off to unequip',
+                    statusTag:
+                      label === 'Off-Hand' && twoHandedStowsShield ? 'Stowed (2H)' : label,
+                    hint:
+                      label === 'Off-Hand'
+                        ? twoHandedStowsShield
+                          ? 'Equip a 1-handed weapon to raise your shield with Use'
+                          : 'Hold Use (E/Alt) in battle to block'
+                        : 'Equipped · Click to inspect or Off to unequip',
                   });
                 }}
                 onMouseLeave={() => setHoverTooltip(null)}
@@ -583,8 +603,11 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                   </div>
                 )}
               <div className="min-w-0 flex-1">
-                <div className="text-[10px] font-bold uppercase tracking-wider text-[#64748B]">
-                  {label}
+                <div className="text-[10px] font-bold uppercase tracking-wider text-[#64748B] flex items-center gap-1">
+                  <span>{label}</span>
+                  {label === 'Off-Hand' && twoHandedStowsShield && (
+                    <span className="text-[9px] text-[#F59E0B]">· Stowed</span>
+                  )}
                 </div>
                 <div className="text-xs font-bold truncate text-[#E7ECF5]">
                   {def ? def.name : 'Empty'}
@@ -813,8 +836,15 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                   const meta = resolveItemMetadata(def, st);
                   const active = selectedId === st.itemId;
                   const held = equipment.heldItemId === st.itemId;
+                  const offhandWorn = equipment.offhandItemId === st.itemId;
                   const worn = isWorn(def);
-                  const statusTag = held ? 'Held' : worn ? 'Worn' : undefined;
+                  const statusTag = held
+                    ? 'Main Hand'
+                    : offhandWorn
+                    ? 'Off-Hand'
+                    : worn
+                    ? 'Worn'
+                    : undefined;
                   const rarityColor = RARITY_COLORS[meta.rarity] ?? '#94A3B8';
                   const durPct =
                     meta.maxDurability > 1
@@ -900,7 +930,7 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                       </div>
                       <div className="text-[10px] font-semibold capitalize text-[#8B93A8] mt-0.5 truncate">
                         {def.category}
-                        {held ? ' · Held' : worn ? ' · Worn' : ''}
+                        {held ? ' · Held' : equipment.offhandItemId === st.itemId ? ' · Off-Hand' : worn ? ' · Worn' : ''}
                         {durPct !== null && durPct < 100 ? ` · ${durPct}%` : ''}
                       </div>
                     </button>
@@ -966,8 +996,9 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                       Qty {selectedQty}
                       {' · '}
                       {selectedMetadata.weight.toFixed(1)}kg
-                      {equipment.heldItemId === selectedDef.id ? ' · Held' : ''}
-                      {isWorn(selectedDef) ? ' · Worn' : ''}
+                      {equipment.heldItemId === selectedDef.id ? ' · Main Hand' : ''}
+                      {equipment.offhandItemId === selectedDef.id ? ' · Off-Hand' : ''}
+                      {isWorn(selectedDef) && equipment.offhandItemId !== selectedDef.id ? ' · Worn' : ''}
                     </div>
                     <p className="text-xs text-[#CBD5E1] leading-relaxed pt-1">
                       {selectedDef.description}
@@ -1058,22 +1089,24 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                   )}
                 </div>
 
-                {/* Primary Actions: Hold / Wear / Consume / Add to Workbench */}
+                {/* Primary Actions: Hold / Equip Off-Hand / Wear / Consume / Add to Workbench */}
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-0.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onHoldItem(equipment.heldItemId === selectedDef.id ? null : selectedDef.id)
-                    }
-                    className={`py-2 px-3 rounded-xl text-xs font-extrabold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap ${
-                      equipment.heldItemId === selectedDef.id
-                        ? 'bg-[#38BDF8]/20 text-[#38BDF8] border border-[#38BDF8]/40'
-                        : 'bg-[#7C5CFF] hover:bg-[#6A48F5] text-white'
-                    }`}
-                  >
-                    <Hand size={13} />
-                    <span>{equipment.heldItemId === selectedDef.id ? 'Put Away' : 'Hold'}</span>
-                  </button>
+                  {selectedDef.wearSlot !== 'offhand' && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onHoldItem(equipment.heldItemId === selectedDef.id ? null : selectedDef.id)
+                      }
+                      className={`py-2 px-3 rounded-xl text-xs font-extrabold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap ${
+                        equipment.heldItemId === selectedDef.id
+                          ? 'bg-[#38BDF8]/20 text-[#38BDF8] border border-[#38BDF8]/40'
+                          : 'bg-[#7C5CFF] hover:bg-[#6A48F5] text-white'
+                      }`}
+                    >
+                      <Hand size={13} />
+                      <span>{equipment.heldItemId === selectedDef.id ? 'Put Away' : 'Hold'}</span>
+                    </button>
+                  )}
 
                   {selectedDef.category === 'wearable' && selectedDef.wearSlot && (
                     <button
@@ -1089,8 +1122,16 @@ export const InventoryModal: React.FC<InventoryModalProps> = ({
                           : 'bg-[#20B46A] hover:bg-[#199958] text-white'
                       }`}
                     >
-                      <Shirt size={13} />
-                      <span>{isWorn(selectedDef) ? 'Take Off' : 'Wear'}</span>
+                      {selectedDef.wearSlot === 'offhand' ? <Shield size={13} /> : <Shirt size={13} />}
+                      <span>
+                        {selectedDef.wearSlot === 'offhand'
+                          ? isWorn(selectedDef)
+                            ? 'Remove Shield'
+                            : 'Equip Off-Hand'
+                          : isWorn(selectedDef)
+                          ? 'Take Off'
+                          : 'Wear'}
+                      </span>
                     </button>
                   )}
 

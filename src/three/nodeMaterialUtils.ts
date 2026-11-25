@@ -1021,6 +1021,7 @@ function wrapSingleEntityMaterial(
   hasVariant: boolean
 ): THREE.Material {
   // Never disturb custom particle / unlit glow materials or already-toon materials unless explicitly overridden
+  if (mat.userData?.preserveGlowMat) return mat;
   if ((mat as THREE.MeshBasicMaterial).isMeshBasicMaterial && !hasVariant) return mat;
 
   // Canopy Engine trees already carry their own wind + weathering/wear TSL graph

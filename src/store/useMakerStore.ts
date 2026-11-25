@@ -46,6 +46,8 @@ import type {
   CharacterMakerDoc,
   CraftingRecipe,
   CustomAssetMeta,
+  CustomClipSlot,
+  CustomMotionPreset,
   CustomTextureAssetMeta,
   CustomTextureResolution,
   DoorConfig,
@@ -66,6 +68,8 @@ import type {
   LogicWorkspaceMode,
   MakerIssue,
   MonsterBlueprint,
+  MotionActorTarget,
+  MotionAssignmentScope,
   MotionStudioSection,
   ObjectInteractionAttributeId,
   ObjectInteractionCalibration,
@@ -76,6 +80,7 @@ import type {
   RuleRecipe,
   SavePresetEntry,
   SavePresetScope,
+  SavedPosePreset,
   SceneryTextureSlot,
   StageTab,
   StudioTheme,
@@ -589,6 +594,8 @@ export function useMakerStore() {
     Record<string, { durability: number; maxDurability: number }>
   >({});
   const [motionAssetId, setMotionAssetId] = useState<string | null>(null);
+  const [motionActorTarget, setMotionActorTarget] = useState<MotionActorTarget | null>(null);
+  const [motionRequestedSlot, setMotionRequestedSlot] = useState<CustomClipSlot | null>(null);
   const [objectMakerOpen, setObjectMakerOpen] = useState(false);
   const [objectMakerTargetAssetId, setObjectMakerTargetAssetId] = useState<string | null>(null);
   const [plantMakerOpen, setPlantMakerOpen] = useState(false);
@@ -842,6 +849,363 @@ export function useMakerStore() {
     await updateAssetMetaRecord(meta);
     setCustomAssets((prev) => prev.map((a) => (a.id === meta.id ? meta : a)));
   }, []);
+
+  const saveUniversalMotionPreset = useCallback(
+    async (
+      preset: CustomMotionPreset,
+      target: MotionActorTarget,
+      customAssetMeta?: CustomAssetMeta
+    ) => {
+      // Persist onto customAsset if applicable
+      if (target.kind === 'customAsset' && customAssetMeta) {
+        const list = customAssetMeta.customAnimations ?? [];
+        const exists = list.some((p) => p.id === preset.id);
+        const nextList = exists
+          ? list.map((p) => (p.id === preset.id ? preset : p))
+          : [...list, preset];
+        await updateCustomAssetMeta({
+          ...customAssetMeta,
+          customAnimations: nextList,
+        });
+      }
+      // Also store into project.customMotionLibrary so Logic Rules & cross-actor sharing always find it
+      updateProject(`save motion "${preset.name}"`, (proj) => {
+        const lib = proj.customMotionLibrary ?? [];
+        const exists = lib.some((p) => p.id === preset.id);
+        const nextLib = exists
+          ? lib.map((p) => (p.id === preset.id ? preset : p))
+          : [...lib, preset];
+
+        // If target is a MonsterBlueprint in customMonsters or level entities, keep its copy updated too
+        let nextMonsters = proj.customMonsters;
+        if (target.kind === 'monsterBlueprint' && nextMonsters) {
+          nextMonsters = nextMonsters.map((m) => {
+            if (m.id !== target.monsterId && m.presetId !== target.monsterId) return m;
+            const mList = m.customAnimations ?? [];
+            const mHas = mList.some((p) => p.id === preset.id);
+            return {
+              ...m,
+              customAnimations: mHas
+                ? mList.map((p) => (p.id === preset.id ? preset : p))
+                : [...mList, preset],
+            };
+          });
+        }
+        return {
+          ...proj,
+          customMotionLibrary: nextLib,
+          customMonsters: nextMonsters,
+        };
+      });
+    },
+    [updateCustomAssetMeta, updateProject]
+  );
+
+  const deleteUniversalMotionPreset = useCallback(
+    async (
+      presetId: string,
+      target: MotionActorTarget,
+      customAssetMeta?: CustomAssetMeta
+    ) => {
+      if (target.kind === 'customAsset' && customAssetMeta) {
+        const nextDefs = { ...(customAssetMeta.defaultSlotPresets ?? {}) };
+        (Object.keys(nextDefs) as CustomClipSlot[]).forEach((s) => {
+          if (nextDefs[s] === presetId) delete nextDefs[s];
+        });
+        await updateCustomAssetMeta({
+          ...customAssetMeta,
+          customAnimations: (customAssetMeta.customAnimations ?? []).filter((p) => p.id !== presetId),
+          defaultSlotPresets: nextDefs,
+        });
+      }
+      updateProject('delete saved motion variation', (proj) => {
+        const clearSlotMap = (m?: Partial<Record<CustomClipSlot, string>>) => {
+          if (!m) return m;
+          const next = { ...m };
+          (Object.keys(next) as CustomClipSlot[]).forEach((s) => {
+            if (next[s] === presetId) delete next[s];
+          });
+          return next;
+        };
+        const nextSpecies = proj.buddyMotionSlotsByCreature
+          ? Object.fromEntries(
+              Object.entries(proj.buddyMotionSlotsByCreature).map(([sp, mp]) => [
+                sp,
+                clearSlotMap(mp),
+              ])
+            )
+          : undefined;
+        return {
+          ...proj,
+          customMotionLibrary: (proj.customMotionLibrary ?? []).filter((p) => p.id !== presetId),
+          heroMotionSlots: clearSlotMap(proj.heroMotionSlots),
+          npcMotionSlots: clearSlotMap(proj.npcMotionSlots),
+          buddyMotionSlots: clearSlotMap(proj.buddyMotionSlots),
+          buddyMotionSlotsByCreature: nextSpecies,
+          baddieMotionSlots: clearSlotMap(proj.baddieMotionSlots),
+        };
+      });
+    },
+    [updateCustomAssetMeta, updateProject]
+  );
+
+  const assignMotionPresetToScope = useCallback(
+    async (opts: {
+      preset: CustomMotionPreset;
+      slot: CustomClipSlot;
+      scope: MotionAssignmentScope;
+      target: MotionActorTarget;
+      entityId?: string;
+      blueprint?: MonsterBlueprint;
+      customAssetMeta?: CustomAssetMeta;
+    }) => {
+      const { preset, slot, scope, target, entityId, blueprint, customAssetMeta } = opts;
+      // Ensure preset is saved first in library
+      await saveUniversalMotionPreset(preset, target, customAssetMeta);
+
+      if (scope === 'customAsset' && customAssetMeta) {
+        await updateCustomAssetMeta({
+          ...customAssetMeta,
+          customAnimations: [
+            ...(customAssetMeta.customAnimations ?? []).filter((p) => p.id !== preset.id),
+            preset,
+          ],
+          defaultSlotPresets: {
+            ...(customAssetMeta.defaultSlotPresets ?? {}),
+            [slot]: preset.id,
+          },
+        });
+        return;
+      }
+
+      updateProject(`assign motion to ${scope} (${slot})`, (proj) => {
+        if (scope === 'heroDefault') {
+          return {
+            ...proj,
+            heroMotionSlots: { ...(proj.heroMotionSlots ?? {}), [slot]: preset.id },
+          };
+        }
+        if (scope === 'npcDefault') {
+          return {
+            ...proj,
+            npcMotionSlots: { ...(proj.npcMotionSlots ?? {}), [slot]: preset.id },
+          };
+        }
+        if (scope === 'buddyDefault') {
+          if (target.kind === 'buddyCritter') {
+            const prevBySp = proj.buddyMotionSlotsByCreature ?? {};
+            return {
+              ...proj,
+              buddyMotionSlotsByCreature: {
+                ...prevBySp,
+                [target.creatureType]: { ...(prevBySp[target.creatureType] ?? {}), [slot]: preset.id },
+              },
+            };
+          }
+          return {
+            ...proj,
+            buddyMotionSlots: { ...(proj.buddyMotionSlots ?? {}), [slot]: preset.id },
+          };
+        }
+        if (scope === 'baddieDefault') {
+          return {
+            ...proj,
+            baddieMotionSlots: { ...(proj.baddieMotionSlots ?? {}), [slot]: preset.id },
+          };
+        }
+        if (scope === 'monsterBlueprint') {
+          const bpId =
+            target.kind === 'monsterBlueprint' ? target.monsterId : blueprint?.id;
+          const prevMonsters = proj.customMonsters ?? [];
+          let foundInProject = false;
+          const nextMonsters = prevMonsters.map((m) => {
+            if (m.id !== bpId && m.presetId !== bpId) return m;
+            foundInProject = true;
+            return {
+              ...m,
+              customAnimations: [
+                ...(m.customAnimations ?? []).filter((p) => p.id !== preset.id),
+                preset,
+              ],
+              defaultSlotPresets: { ...(m.defaultSlotPresets ?? {}), [slot]: preset.id },
+            };
+          });
+          if (!foundInProject && blueprint) {
+            nextMonsters.push({
+              ...blueprint,
+              customAnimations: [
+                ...(blueprint.customAnimations ?? []).filter((p) => p.id !== preset.id),
+                preset,
+              ],
+              defaultSlotPresets: { ...(blueprint.defaultSlotPresets ?? {}), [slot]: preset.id },
+            });
+          }
+          // Also propagate onto placed entities using this monster blueprint
+          const nextLevels = proj.levels.map((lvl) => ({
+            ...lvl,
+            entities: lvl.entities.map((ent) => {
+              if (!ent.monsterConfig) return ent;
+              if (ent.monsterConfig.id !== bpId && ent.monsterConfig.presetId !== bpId) return ent;
+              return {
+                ...ent,
+                monsterConfig: {
+                  ...ent.monsterConfig,
+                  customAnimations: [
+                    ...(ent.monsterConfig.customAnimations ?? []).filter((p) => p.id !== preset.id),
+                    preset,
+                  ],
+                  defaultSlotPresets: {
+                    ...(ent.monsterConfig.defaultSlotPresets ?? {}),
+                    [slot]: preset.id,
+                  },
+                },
+              };
+            }),
+          }));
+          return { ...proj, customMonsters: nextMonsters, levels: nextLevels };
+        }
+        if (scope === 'entityOverride' && entityId) {
+          const nextLevels = proj.levels.map((lvl) => ({
+            ...lvl,
+            entities: lvl.entities.map((ent) => {
+              if (ent.id !== entityId) return ent;
+              return {
+                ...ent,
+                motionSlotOverrides: { ...(ent.motionSlotOverrides ?? {}), [slot]: preset.id },
+                motionCustomAnimations: [
+                  ...(ent.motionCustomAnimations ?? []).filter((p) => p.id !== preset.id),
+                  preset,
+                ],
+              };
+            }),
+          }));
+          return { ...proj, levels: nextLevels };
+        }
+        return proj;
+      });
+    },
+    [saveUniversalMotionPreset, updateCustomAssetMeta, updateProject]
+  );
+
+  const restoreDefaultMotionSlot = useCallback(
+    async (opts: {
+      slot: CustomClipSlot;
+      scope: MotionAssignmentScope;
+      target: MotionActorTarget;
+      entityId?: string;
+      customAssetMeta?: CustomAssetMeta;
+    }) => {
+      const { slot, scope, target, entityId, customAssetMeta } = opts;
+      if (scope === 'customAsset' && customAssetMeta) {
+        const next = { ...(customAssetMeta.defaultSlotPresets ?? {}) };
+        delete next[slot];
+        await updateCustomAssetMeta({ ...customAssetMeta, defaultSlotPresets: next });
+        return;
+      }
+      updateProject(`restore default ${slot}`, (proj) => {
+        const dropKey = (m?: Partial<Record<CustomClipSlot, string>>) => {
+          if (!m) return m;
+          const copy = { ...m };
+          delete copy[slot];
+          return copy;
+        };
+        if (scope === 'heroDefault') return { ...proj, heroMotionSlots: dropKey(proj.heroMotionSlots) };
+        if (scope === 'npcDefault') return { ...proj, npcMotionSlots: dropKey(proj.npcMotionSlots) };
+        if (scope === 'buddyDefault') {
+          if (target.kind === 'buddyCritter') {
+            const prev = proj.buddyMotionSlotsByCreature ?? {};
+            return {
+              ...proj,
+              buddyMotionSlotsByCreature: {
+                ...prev,
+                [target.creatureType]: dropKey(prev[target.creatureType]),
+              },
+            };
+          }
+          return { ...proj, buddyMotionSlots: dropKey(proj.buddyMotionSlots) };
+        }
+        if (scope === 'baddieDefault') return { ...proj, baddieMotionSlots: dropKey(proj.baddieMotionSlots) };
+        if (scope === 'monsterBlueprint') {
+          const bpId = target.kind === 'monsterBlueprint' ? target.monsterId : undefined;
+          return {
+            ...proj,
+            customMonsters: (proj.customMonsters ?? []).map((m) =>
+              m.id === bpId || m.presetId === bpId
+                ? { ...m, defaultSlotPresets: dropKey(m.defaultSlotPresets) }
+                : m
+            ),
+            levels: proj.levels.map((lvl) => ({
+              ...lvl,
+              entities: lvl.entities.map((ent) =>
+                ent.monsterConfig && (ent.monsterConfig.id === bpId || ent.monsterConfig.presetId === bpId)
+                  ? {
+                      ...ent,
+                      monsterConfig: {
+                        ...ent.monsterConfig,
+                        defaultSlotPresets: dropKey(ent.monsterConfig.defaultSlotPresets),
+                      },
+                    }
+                  : ent
+              ),
+            })),
+          };
+        }
+        if (scope === 'entityOverride' && entityId) {
+          return {
+            ...proj,
+            levels: proj.levels.map((lvl) => ({
+              ...lvl,
+              entities: lvl.entities.map((ent) =>
+                ent.id === entityId
+                  ? { ...ent, motionSlotOverrides: dropKey(ent.motionSlotOverrides) }
+                  : ent
+              ),
+            })),
+          };
+        }
+        return proj;
+      });
+    },
+    [updateCustomAssetMeta, updateProject]
+  );
+
+  const saveUniversalPosePreset = useCallback(
+    async (pose: SavedPosePreset, target: MotionActorTarget, customAssetMeta?: CustomAssetMeta) => {
+      if (target.kind === 'customAsset' && customAssetMeta) {
+        const list = customAssetMeta.savedPoses ?? [];
+        const exists = list.some((p) => p.id === pose.id);
+        await updateCustomAssetMeta({
+          ...customAssetMeta,
+          savedPoses: exists ? list.map((p) => (p.id === pose.id ? pose : p)) : [...list, pose],
+        });
+      }
+      updateProject(`save pose "${pose.name}"`, (proj) => {
+        const lib = proj.customPoseLibrary ?? [];
+        const exists = lib.some((p) => p.id === pose.id);
+        return {
+          ...proj,
+          customPoseLibrary: exists ? lib.map((p) => (p.id === pose.id ? pose : p)) : [...lib, pose],
+        };
+      });
+    },
+    [updateCustomAssetMeta, updateProject]
+  );
+
+  const deleteUniversalPosePreset = useCallback(
+    async (poseId: string, target: MotionActorTarget, customAssetMeta?: CustomAssetMeta) => {
+      if (target.kind === 'customAsset' && customAssetMeta) {
+        await updateCustomAssetMeta({
+          ...customAssetMeta,
+          savedPoses: (customAssetMeta.savedPoses ?? []).filter((p) => p.id !== poseId),
+        });
+      }
+      updateProject('delete saved pose', (proj) => ({
+        ...proj,
+        customPoseLibrary: (proj.customPoseLibrary ?? []).filter((p) => p.id !== poseId),
+      }));
+    },
+    [updateCustomAssetMeta, updateProject]
+  );
 
   const saveGeneratedAsset = useCallback(
     async (opts: {
@@ -3751,12 +4115,41 @@ export function useMakerStore() {
     setLogicMode,
     motionAssetId,
     setMotionAssetId,
+    motionActorTarget,
+    setMotionActorTarget,
+    motionRequestedSlot,
+    setMotionRequestedSlot,
     openMotionStudio: (assetId?: string) => {
-      if (assetId) setMotionAssetId(assetId);
+      if (assetId) {
+        setMotionAssetId(assetId);
+        const found = customAssets.find((a) => a.id === assetId);
+        setMotionActorTarget({
+          kind: 'customAsset',
+          category: 'hero',
+          assetId,
+          label: found?.name ?? 'Custom Character',
+        });
+      }
       setShowingAssetVault(false);
       setMotionSection('gait');
       setSelectedTab('motion');
     },
+    openMotionStudioForTarget: (target: MotionActorTarget, initialSlot?: CustomClipSlot) => {
+      if (target.kind === 'customAsset') {
+        setMotionAssetId(target.assetId);
+      }
+      setMotionActorTarget(target);
+      setMotionRequestedSlot(initialSlot ?? null);
+      setShowingAssetVault(false);
+      setMotionSection('pose');
+      setSelectedTab('motion');
+    },
+    saveUniversalMotionPreset,
+    deleteUniversalMotionPreset,
+    assignMotionPresetToScope,
+    restoreDefaultMotionSlot,
+    saveUniversalPosePreset,
+    deleteUniversalPosePreset,
     openHeroActions: () => {
       setMotionSection('actions');
       setSelectedTab('motion');

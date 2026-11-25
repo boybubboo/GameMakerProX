@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type {
+  BaddieWindupClueStyle,
   CharacterEyePupilStyle,
   CharacterMaterialFinish,
   CharacterSurfaceCoatConfig,
@@ -31,6 +32,7 @@ import type {
   MonsterWingsConfig,
   MonsterWingStyle,
 } from '../types/maker';
+import { resolveEffectiveWindupClueStyle } from '../data/baddieActionLibrary';
 import {
   polygonizeSdfToGeometry,
   SdfFieldEvaluator,
@@ -4705,9 +4707,21 @@ export function animateQuadrupedMonster(
   recoilRoll = 0,
   attackType?: MonsterAttackType,
   mouthMoodOverride?: CreatureExpressionMood,
-  eyebrowMoodOverride?: CreatureExpressionMood
+  eyebrowMoodOverride?: CreatureExpressionMood,
+  airborneFrac = 0,
+  windupClueStyle?: BaddieWindupClueStyle
 ): void {
   const moveAttack = attackType ?? rig.blueprint.primaryAttack ?? 'clawSlash';
+  const clueStyle = resolveEffectiveWindupClueStyle(windupClueStyle, moveAttack, {
+    headCount: rig.heads.length,
+    canFly: rig.canFly,
+    legPairs: rig.legPairs,
+  });
+  const windupP = THREE.MathUtils.clamp(stateProgress, 0, 1);
+  const clueBeatsEnv = windupP < 0.76 ? Math.sin((windupP / 0.76) * Math.PI) : 0;
+  const pullBackEnv =
+    windupP >= 0.76 ? THREE.MathUtils.smoothstep((windupP - 0.76) / 0.24, 0, 1) : 0;
+  const airBlend = THREE.MathUtils.clamp(airborneFrac, 0, 1);
   const isBreathOrBeam =
     moveAttack === 'fireBreath' ||
     moveAttack === 'iceBreath' ||
@@ -4725,31 +4739,64 @@ export function animateQuadrupedMonster(
   let chestBreathScale = 1.0;
 
   if (state === 'dying') {
-    targetBodyY *= 0.65;
-    targetBodyPitch = -0.95;
-    targetBodyRoll = 0.75;
+    const p = THREE.MathUtils.clamp(stateProgress, 0, 1);
+    if (p < 0.28) {
+      const rear = Math.sin((p / 0.28) * Math.PI * 0.5);
+      targetBodyY += 0.24 * rear;
+      targetBodyPitch = -0.52 * rear;
+      targetBodyRoll = Math.sin(elapsed * 26) * 0.08 * rear;
+    } else {
+      const collapse = THREE.MathUtils.smoothstep((p - 0.28) / 0.62, 0, 1);
+      const slumpedY = Math.max(0.14, targetBodyY * 0.22);
+      targetBodyY = THREE.MathUtils.lerp(targetBodyY + 0.16, slumpedY, collapse);
+      targetBodyPitch = THREE.MathUtils.lerp(-0.46, 0.22, collapse);
+      targetBodyRoll = THREE.MathUtils.lerp(0.08, 0.96, collapse);
+    }
   } else if (state === 'stagger') {
     targetBodyPitch = -0.26 + recoilPitch;
     targetBodyRoll = Math.sin(elapsed * 24) * 0.14;
   } else if (state === 'fly') {
-    targetBodyY += 0.95 + Math.sin(elapsed * 3.4) * 0.18;
+    const baseLift = airBlend > 0.02 ? 0 : 0.95;
+    targetBodyY += baseLift + Math.sin(elapsed * 3.4) * 0.16;
     targetBodyPitch = -0.06 + Math.sin(elapsed * 3.4 - 0.5) * 0.08;
   } else if (state === 'celebrate') {
     targetBodyY += Math.abs(Math.sin(elapsed * 6.5)) * 0.22;
     targetBodyPitch = -0.18 + Math.sin(elapsed * 6.5) * 0.1;
   } else if (state === 'windup') {
-    if (moveAttack === 'groundPound' || moveAttack === 'sonicRoar') {
-      targetBodyY += 0.18 * stateProgress;
-      targetBodyPitch = -0.62 * stateProgress;
-    } else if (moveAttack === 'tailSmash') {
-      targetBodyYaw = 0.62 * stateProgress;
-      targetBodyRoll = -0.12 * stateProgress;
-    } else if (moveAttack === 'chargeGore') {
-      targetBodyY -= 0.14 * stateProgress;
-      targetBodyPitch = 0.22 * stateProgress;
+    if (clueStyle === 'headSway3') {
+      const swayWave = windupP < 0.76 ? Math.sin((windupP / 0.76) * Math.PI * 6) : 0;
+      targetBodyYaw = swayWave * 0.16 * (0.5 + 0.5 * clueBeatsEnv);
+      targetBodyRoll = -swayWave * 0.1 * clueBeatsEnv;
+      targetBodyY += 0.06 * clueBeatsEnv + (moveAttack === 'groundPound' ? 0.22 : 0.12) * pullBackEnv;
+      targetBodyPitch =
+        -0.14 * clueBeatsEnv + (moveAttack === 'groundPound' ? -0.68 : -0.46) * pullBackEnv;
+      chestBreathScale = 1.0 + 0.06 * Math.abs(swayWave) + 0.1 * pullBackEnv;
+    } else if (clueStyle === 'footMarch') {
+      const stompWave = windupP < 0.78 ? Math.abs(Math.sin((windupP / 0.78) * Math.PI * 6)) : 0;
+      targetBodyY += stompWave * 0.09 + (moveAttack === 'groundPound' ? 0.22 : -0.1) * pullBackEnv;
+      targetBodyRoll =
+        (windupP < 0.78 ? Math.sin((windupP / 0.78) * Math.PI * 6) : 0) * 0.09;
+      if (moveAttack === 'groundPound' || moveAttack === 'sonicRoar') {
+        targetBodyPitch = -0.16 * stompWave - 0.65 * pullBackEnv;
+      } else if (moveAttack === 'tailSmash') {
+        targetBodyYaw = 0.65 * pullBackEnv + (windupP < 0.78 ? Math.sin((windupP / 0.78) * Math.PI * 6) * 0.14 : 0);
+        targetBodyPitch = -0.14 * pullBackEnv;
+      } else if (moveAttack === 'chargeGore') {
+        targetBodyPitch = 0.26 * pullBackEnv + 0.08 * stompWave;
+      } else {
+        targetBodyPitch = -0.34 * pullBackEnv;
+      }
+    } else if (clueStyle === 'wingFlare') {
+      const pulse = windupP < 0.76 ? Math.abs(Math.sin((windupP / 0.76) * Math.PI * 3)) : 0;
+      targetBodyY += 0.12 * pulse + 0.16 * pullBackEnv;
+      targetBodyPitch = -0.22 * pulse - 0.48 * pullBackEnv;
+      chestBreathScale = 1.0 + 0.08 * pulse + 0.1 * pullBackEnv;
     } else {
-      targetBodyPitch = -0.28 * stateProgress;
-      targetBodyY += 0.06 * stateProgress;
+      // crouchPounce
+      const coil = windupP < 0.75 ? Math.sin((windupP / 0.75) * Math.PI * 6) : 0;
+      targetBodyY -= 0.16 * THREE.MathUtils.clamp(windupP * 1.35, 0, 1);
+      targetBodyRoll = coil * 0.08;
+      targetBodyPitch = 0.24 * pullBackEnv + 0.1 * windupP;
     }
   } else if (state === 'strike') {
     const p = Math.sin(THREE.MathUtils.clamp(stateProgress, 0, 1) * Math.PI);
@@ -4803,23 +4850,54 @@ export function animateQuadrupedMonster(
     let kneeX = 0;
     let pawX = 0;
 
-    if (state === 'fly') {
+    if (state === 'dying') {
+      const p = THREE.MathUtils.clamp(stateProgress, 0, 1);
+      const slump = THREE.MathUtils.smoothstep(Math.max(0, (p - 0.22) / 0.68), 0, 1);
+      hipX = THREE.MathUtils.lerp(leg.pairIndex === 0 ? -0.42 : 0.25, leg.pairIndex === 0 ? 0.65 : -0.58, slump);
+      hipZ = leg.side * 0.35 * slump;
+      kneeX = THREE.MathUtils.lerp(0.35, 0.95, slump);
+      pawX = 0.4 * slump;
+    } else if (state === 'fly') {
       hipX = leg.pairIndex === 0 ? -0.35 : 0.45;
       kneeX = 0.55;
       pawX = 0.2;
-    } else if (state === 'windup' && moveAttack === 'groundPound') {
-      if (leg.pairIndex === 0) {
-        hipX = -0.85 * stateProgress;
-        kneeX = 0.65 * stateProgress;
-        pawX = 0.25 * stateProgress;
-      } else {
-        hipX = 0.35 * stateProgress;
-        kneeX = 0.3 * stateProgress;
+    } else if (state === 'windup') {
+      if (clueStyle === 'footMarch' && !(airBlend > 0.25)) {
+        if (windupP < 0.78) {
+          const marchRaw = Math.sin((windupP / 0.78) * Math.PI * 6 + (leg.side * Math.PI * 0.5) + leg.pairIndex * Math.PI * 0.5);
+          const lift = Math.max(0, marchRaw);
+          hipX = -0.78 * lift + 0.16 * Math.max(0, -marchRaw);
+          kneeX = (leg.pairIndex === rig.legPairs - 1 ? -0.62 : 0.92) * lift;
+          pawX = 0.34 * lift;
+        } else if (moveAttack === 'groundPound' || moveAttack === 'sonicRoar') {
+          hipX = leg.pairIndex === 0 ? -0.92 * pullBackEnv : 0.38 * pullBackEnv;
+          kneeX = leg.pairIndex === 0 ? 0.72 * pullBackEnv : 0.32 * pullBackEnv;
+          pawX = 0.26 * pullBackEnv;
+        } else if (moveAttack === 'chargeGore') {
+          hipX = leg.pairIndex === 0 ? 0.34 * pullBackEnv : -0.45 * pullBackEnv;
+          kneeX = 0.52 * pullBackEnv;
+        }
+      } else if (clueStyle === 'crouchPounce' && !(airBlend > 0.25)) {
+        const crouchAmt = THREE.MathUtils.clamp(windupP * 1.4, 0, 1);
+        const shift = windupP < 0.75 ? Math.sin((windupP / 0.75) * Math.PI * 6) * leg.side : 0;
+        hipX = (leg.pairIndex === 0 ? 0.35 : -0.45) * crouchAmt;
+        hipZ = leg.side * 0.14 * crouchAmt + shift * 0.09;
+        kneeX = (leg.pairIndex === rig.legPairs - 1 ? -0.58 : 0.68) * crouchAmt;
+      } else if (moveAttack === 'groundPound') {
+        if (leg.pairIndex === 0) {
+          hipX = -0.88 * pullBackEnv;
+          kneeX = 0.68 * pullBackEnv;
+          pawX = 0.28 * pullBackEnv;
+        } else {
+          hipX = 0.35 * pullBackEnv;
+          kneeX = 0.3 * pullBackEnv;
+        }
+      } else if (moveAttack === 'clawSlash' && leg.pairIndex === 0 && leg.side === 1) {
+        const beatShake = windupP < 0.76 ? Math.abs(Math.sin((windupP / 0.76) * Math.PI * 3)) * 0.45 : 0;
+        hipX = -0.45 * beatShake - 1.1 * pullBackEnv;
+        kneeX = 0.55 * beatShake + 0.76 * pullBackEnv;
+        pawX = 0.24 * pullBackEnv;
       }
-    } else if (state === 'windup' && moveAttack === 'clawSlash' && leg.pairIndex === 0 && leg.side === 1) {
-      hipX = -1.05 * stateProgress;
-      kneeX = 0.72 * stateProgress;
-      pawX = 0.2 * stateProgress;
     } else if (state === 'strike' && moveAttack === 'clawSlash' && leg.pairIndex === 0 && leg.side === 1) {
       const p = Math.min(1, stateProgress * 1.5);
       hipX = THREE.MathUtils.lerp(-1.05, 0.78, p);
@@ -4929,18 +5007,60 @@ export function animateQuadrupedMonster(
     let headRoll = 0;
     let jawOpen = 0.04 + mOff.jawAdd;
 
-    if (state === 'windup') {
-      if (isBreathOrBeam || moveAttack === 'sonicRoar') {
-        neckPitch = -0.32 * stateProgress;
-        headPitch = -0.18 * stateProgress;
-        jawOpen = 0.28 * stateProgress + mOff.jawAdd * 0.4;
-      } else if (moveAttack === 'chargeGore') {
-        neckPitch = 0.38 * stateProgress;
-        headPitch = 0.32 * stateProgress;
-        jawOpen = 0.14;
+    if (state === 'dying') {
+      const p = THREE.MathUtils.clamp(stateProgress, 0, 1);
+      if (p < 0.28) {
+        const rear = Math.sin((p / 0.28) * Math.PI * 0.5);
+        neckPitch = -0.45 * rear;
+        headPitch = -0.28 * rear;
+        jawOpen = 0.75 * rear;
       } else {
-        neckPitch = -0.22 * stateProgress;
-        jawOpen = 0.35 * stateProgress;
+        const slump = THREE.MathUtils.smoothstep((p - 0.28) / 0.62, 0, 1);
+        neckPitch = THREE.MathUtils.lerp(-0.4, 0.62, slump);
+        neckYaw = 0.25 * slump * (h.headIndex === 0 ? -1 : 1);
+        headPitch = THREE.MathUtils.lerp(-0.24, 0.34, slump);
+        headRoll = 0.42 * slump;
+        jawOpen = THREE.MathUtils.lerp(0.68, 0.08, slump);
+      }
+    } else if (state === 'windup') {
+      if (clueStyle === 'headSway3') {
+        // 3 clear head sways left-right-left, then a sharp pull-back coil right before strike!
+        const headSideBias = rig.heads.length > 1 ? (h.headIndex % 2 === 0 ? 1 : -1) : 1;
+        if (windupP < 0.76) {
+          const u = windupP / 0.76;
+          const sway = Math.sin(u * Math.PI * 6) * headSideBias;
+          const beatSnap = Math.abs(Math.sin(u * Math.PI * 3));
+          neckYaw = sway * 0.58;
+          headYaw = sway * 0.42;
+          headRoll = -sway * 0.26;
+          neckPitch = -0.14 - beatSnap * 0.14;
+          headPitch = -0.08 * beatSnap;
+          jawOpen = 0.18 + beatSnap * 0.26;
+        } else {
+          neckYaw = 0;
+          headYaw = 0;
+          headRoll = 0;
+          neckPitch = -0.84 * pullBackEnv;
+          headPitch = -0.46 * pullBackEnv;
+          jawOpen = 0.24 + 0.52 * pullBackEnv;
+        }
+      } else if (clueStyle === 'footMarch') {
+        const bob = windupP < 0.78 ? Math.sin((windupP / 0.78) * Math.PI * 12) * 0.08 : 0;
+        neckPitch = (moveAttack === 'chargeGore' ? 0.36 : -0.34) * pullBackEnv + bob;
+        headPitch = (moveAttack === 'chargeGore' ? 0.28 : -0.22) * pullBackEnv;
+        jawOpen = 0.2 + 0.38 * windupP;
+      } else if (clueStyle === 'wingFlare') {
+        const beat = windupP < 0.76 ? Math.abs(Math.sin((windupP / 0.76) * Math.PI * 3)) : 0;
+        neckPitch = -0.24 * beat - 0.54 * pullBackEnv;
+        headPitch = -0.16 * beat - 0.3 * pullBackEnv;
+        jawOpen = 0.32 * beat + 0.55 * pullBackEnv;
+      } else {
+        // crouchPounce
+        const weave = windupP < 0.75 ? Math.sin((windupP / 0.75) * Math.PI * 6) * 0.22 : 0;
+        neckYaw = weave;
+        neckPitch = 0.22 * windupP - 0.35 * pullBackEnv;
+        headPitch = -0.28 * windupP;
+        jawOpen = 0.28 * windupP;
       }
     } else if (state === 'strike') {
       const p = Math.sin(THREE.MathUtils.clamp(stateProgress, 0, 1) * Math.PI);
@@ -5012,11 +5132,17 @@ export function animateQuadrupedMonster(
       bMat.opacity = THREE.MathUtils.damp(bMat.opacity, targetOp, 10, dt);
     }
 
-    // Blinking & Mood-Shaped Eyelids
+    // Blinking & Mood-Shaped Eyelids (eyes slowly close during death collapse)
     for (const lid of h.eyelids) {
-      const baseLid = THREE.MathUtils.clamp(lid.restClosedFrac + bOff.lidAdd, 0, 0.72);
-      const closedFrac = THREE.MathUtils.clamp(baseLid + blinkAmt * (1 - baseLid), 0, 1);
-      lid.node.rotation.x = THREE.MathUtils.lerp(lid.minOpenRad, lid.maxCloseRad, closedFrac);
+      if (state === 'dying') {
+        const deathClose = THREE.MathUtils.smoothstep(Math.max(0, (stateProgress - 0.25) / 0.55), 0, 1);
+        const closedFrac = THREE.MathUtils.lerp(lid.restClosedFrac, 0.96, deathClose);
+        lid.node.rotation.x = THREE.MathUtils.lerp(lid.minOpenRad, lid.maxCloseRad, closedFrac);
+      } else {
+        const baseLid = THREE.MathUtils.clamp(lid.restClosedFrac + bOff.lidAdd, 0, 0.72);
+        const closedFrac = THREE.MathUtils.clamp(baseLid + blinkAmt * (1 - baseLid), 0, 1);
+        lid.node.rotation.x = THREE.MathUtils.lerp(lid.minOpenRad, lid.maxCloseRad, closedFrac);
+      }
     }
 
     // Expressive Mood Eyebrows
@@ -5047,7 +5173,11 @@ export function animateQuadrupedMonster(
     const phase = i * 0.75;
     let yaw = Math.sin(elapsed * (state === 'run' ? 6.2 : 2.6) - phase) * (state === 'run' ? 0.24 : 0.15);
     let pitch = Math.sin(elapsed * 1.8 - phase) * 0.08;
-    if (state === 'windup' && moveAttack === 'tailSmash') {
+    if (state === 'dying') {
+      const slump = THREE.MathUtils.smoothstep(Math.max(0, (stateProgress - 0.25) / 0.65), 0, 1);
+      yaw *= 1 - slump;
+      pitch = THREE.MathUtils.lerp(pitch, -0.22, slump);
+    } else if (state === 'windup' && moveAttack === 'tailSmash') {
       yaw = -0.35 * stateProgress;
     } else if (state === 'strike' && moveAttack === 'tailSmash') {
       yaw = THREE.MathUtils.lerp(-0.35, 0.45, Math.min(1, stateProgress * 1.4));
@@ -5056,18 +5186,49 @@ export function animateQuadrupedMonster(
     seg.rotation.x = THREE.MathUtils.damp(seg.rotation.x, pitch, 10, dt);
   }
 
-  // 5. Organic Two-Joint Wing Flap
+  // 5. Organic Two-Joint Wing Flap (supports continuous flying attacks via airBlend!)
   if (rig.wingL && rig.wingR) {
     let flap = Math.sin(elapsed * 2.2) * 0.08;
     let outerFold = 0;
-    if (state === 'fly') {
-      flap = Math.sin(elapsed * 7.8) * 0.62;
-      outerFold = Math.sin(elapsed * 7.8 - 0.65) * 0.38;
+    const hoverFlap = Math.sin(elapsed * 8.2) * 0.62;
+    const hoverOuter = Math.sin(elapsed * 8.2 - 0.65) * 0.38;
+    if (state === 'dying') {
+      const p = THREE.MathUtils.clamp(stateProgress, 0, 1);
+      if (p < 0.28) {
+        flap = 0.58 * (p / 0.28);
+      } else {
+        const slump = THREE.MathUtils.smoothstep((p - 0.28) / 0.65, 0, 1);
+        flap = THREE.MathUtils.lerp(0.55, -0.52, slump);
+        outerFold = 0.45 * slump;
+      }
+    } else if (state === 'fly') {
+      flap = hoverFlap;
+      outerFold = hoverOuter;
+    } else if (airBlend > 0.04) {
+      let attackAccent = 0;
+      if (state === 'windup') {
+        if (clueStyle === 'wingFlare' || clueStyle === 'headSway3') {
+          const pulse = windupP < 0.76 ? Math.abs(Math.sin((windupP / 0.76) * Math.PI * 3)) : 0;
+          attackAccent = 0.34 * pulse + 0.58 * pullBackEnv;
+        } else {
+          attackAccent = 0.42 * windupP;
+        }
+      } else if (state === 'strike') {
+        attackAccent = -0.28 * Math.sin(stateProgress * Math.PI);
+      }
+      flap = hoverFlap * airBlend * (state === 'windup' ? 0.5 : 1) + attackAccent;
+      outerFold = hoverOuter * airBlend;
     } else if (state === 'run') {
       flap = Math.sin(walkPhase) * 0.25;
       outerFold = 0.2;
     } else if (state === 'windup') {
-      flap = 0.55 * stateProgress;
+      if (clueStyle === 'wingFlare') {
+        const pulse = windupP < 0.76 ? Math.abs(Math.sin((windupP / 0.76) * Math.PI * 3)) : 0;
+        flap = 0.68 * pulse + 0.85 * pullBackEnv;
+        outerFold = -0.28 * pulse;
+      } else {
+        flap = 0.38 * windupP + 0.45 * pullBackEnv;
+      }
     } else if (state === 'strike') {
       flap = -0.35 * Math.sin(stateProgress * Math.PI);
     }

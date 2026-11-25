@@ -24,7 +24,20 @@ import type {
   CustomAssetMeta,
   CustomClipSlot,
   CustomRigSettings,
+  GameLevel,
+  GameProject,
+  MotionActorTarget,
+  MotionRigArchetype,
 } from '../../types/maker';
+import {
+  applyContextPropsToHeroRig,
+  describeTargetKey,
+  instantiateStudioActor,
+  listStudioActors,
+  type StudioActorDescriptor,
+  type StudioActorRuntime,
+  type StudioContextPropsState,
+} from '../../three/universalMotionAdapter';
 import { buildQuickJointList } from './MotionEditorPanel';
 
 export type StageCameraPreset = 'front' | 'side' | 'back' | 'threeQuarter';
@@ -223,13 +236,22 @@ interface StageRefs {
   jointHitMeshes: Map<string, THREE.Mesh>;
   ghostLines: THREE.LineSegments;
   ghostPoints: THREE.Points;
+  floorMesh: THREE.Mesh;
+  gridHelper: THREE.GridHelper;
+  arrowMesh: THREE.Mesh;
   instance: CustomModelInstance | null;
+  studioRuntime: StudioActorRuntime | null;
   camGoalPos: THREE.Vector3 | null;
   camGoalTarget: THREE.Vector3 | null;
 }
 
 export interface RigPreviewStageProps {
-  asset: CustomAssetMeta;
+  asset?: CustomAssetMeta | null;
+  actorTarget?: MotionActorTarget | null;
+  project?: GameProject | null;
+  currentLevel?: GameLevel | null;
+  customAssets?: CustomAssetMeta[];
+  contextProps?: StudioContextPropsState;
   rigSettings: CustomRigSettings;
   boneNames: string[];
   previewSlot: CustomClipSlot;
@@ -258,12 +280,25 @@ export interface RigPreviewStageProps {
     ((slot: CustomClipSlot) => { bones: Record<string, BonePoseAngles>; hipsOffsetY: number } | null) | null
   >;
   capturePoseThumbnailRef?: React.MutableRefObject<(() => string | null) | null>;
+  onRuntimeReady?: (info: {
+    boneNames: string[];
+    rigSettings: CustomRigSettings;
+    archetype: MotionRigArchetype;
+    hipsHeightRef: number;
+    hasTelegraph: boolean;
+    hasHeroProps: boolean;
+  }) => void;
   onDriverChange?: (label: string) => void;
   onTestStatusChange?: (status: string | null) => void;
 }
 
 export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
-  asset,
+  asset = null,
+  actorTarget = null,
+  project = null,
+  currentLevel = null,
+  customAssets = [],
+  contextProps,
   rigSettings,
   boneNames,
   previewSlot,
@@ -290,6 +325,7 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
   onPlayheadTick,
   captureLivePoseRef,
   capturePoseThumbnailRef,
+  onRuntimeReady,
   onDriverChange,
   onTestStatusChange,
 }) => {
@@ -297,7 +333,7 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
   const stageRef = useRef<StageRefs | null>(null);
   const stateRef = useRef({
     paused,
-    animSpeed: asset.animSpeed,
+    animSpeed: asset?.animSpeed ?? 1,
     highlightBoneName,
     rigSettings,
     boneNames,
@@ -314,16 +350,18 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
     showJointDots,
     gizmoAxisFilter,
     lockCameraOrbit,
+    contextProps,
     onSelectPoseBone,
     onGizmoRotateBone,
     onPlayheadTick,
+    onRuntimeReady,
     onDriverChange,
     onTestStatusChange,
   });
 
   stateRef.current = {
     paused,
-    animSpeed: asset.animSpeed,
+    animSpeed: asset?.animSpeed ?? 1,
     highlightBoneName,
     rigSettings,
     boneNames,
@@ -340,9 +378,11 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
     showJointDots,
     gizmoAxisFilter,
     lockCameraOrbit,
+    contextProps,
     onSelectPoseBone,
     onGizmoRotateBone,
     onPlayheadTick,
+    onRuntimeReady,
     onDriverChange,
     onTestStatusChange,
   };
@@ -695,7 +735,11 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
       jointHitMeshes: new Map(),
       ghostLines,
       ghostPoints,
+      floorMesh: floor,
+      gridHelper: grid,
+      arrowMesh,
       instance: null,
+      studioRuntime: null,
       camGoalPos: null,
       camGoalTarget: null,
     };
@@ -1186,8 +1230,34 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
     }
   }, [lockCameraOrbit]);
 
-  // 2. Load / swap the model instance when asset id or clipMap changes
-  const clipMapSignature = useMemo(() => JSON.stringify(asset.clipMap), [asset.clipMap]);
+  // 2. Load / swap the model instance when asset OR universal actorTarget changes
+  const clipMapSignature = useMemo(() => JSON.stringify(asset?.clipMap ?? {}), [asset?.clipMap]);
+  const actorTargetKey = useMemo(
+    () => (actorTarget ? describeTargetKey(actorTarget) : `legacy:${asset?.id ?? 'none'}`),
+    [actorTarget, asset?.id]
+  );
+
+  const computeCameraVectorsForBounds = (
+    center: THREE.Vector3,
+    radius: number,
+    preset: StageCameraPreset
+  ): { pos: THREE.Vector3; target: THREE.Vector3 } => {
+    const dist = Math.max(2.3, radius * 3.0);
+    const target = center.clone();
+    if (preset === 'front') {
+      return { pos: new THREE.Vector3(center.x, center.y + radius * 0.35, center.z + dist), target };
+    }
+    if (preset === 'side') {
+      return { pos: new THREE.Vector3(center.x + dist, center.y + radius * 0.35, center.z + 0.15), target };
+    }
+    if (preset === 'back') {
+      return { pos: new THREE.Vector3(center.x, center.y + radius * 0.45, center.z - dist), target };
+    }
+    return {
+      pos: new THREE.Vector3(center.x + dist * 0.68, center.y + radius * 0.72, center.z + dist * 0.88),
+      target,
+    };
+  };
 
   useEffect(() => {
     const refs = stageRef.current;
@@ -1213,6 +1283,7 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
       disposeObject3D(refs.modelContainer);
       refs.modelContainer.clear();
       refs.instance = null;
+      refs.studioRuntime = null;
       refs.jointMarker.visible = false;
       refs.ghostLines.visible = false;
       refs.ghostPoints.visible = false;
@@ -1220,24 +1291,18 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
 
     clearCurrentModel();
 
-    void loadCustomAssetToCache(asset.id, asset.category).then(() => {
-      if (cancelled || !stageRef.current) return;
-      const liveRefs = stageRef.current;
+    const mountLoadedInstance = (
+      inst: CustomModelInstance,
+      runtime: StudioActorRuntime | null,
+      legacyAsset: CustomAssetMeta | null
+    ) => {
       const cur = stateRef.current;
-      const inst = instantiateCustomModel(asset.id, {
-        ...asset,
-        rigSettings: cur.rigSettings,
-      });
-      if (!inst) return;
+      refs.instance = inst;
+      refs.studioRuntime = runtime;
+      refs.modelContainer.add(inst.group);
 
-      liveRefs.instance = inst;
-      liveRefs.modelContainer.add(inst.group);
-
-      rebuildJointHandles(
-        liveRefs,
-        inst.proceduralRig?.getAllBoneNames() ?? cur.boneNames,
-        cur.rigSettings
-      );
+      const loadedBones = inst.proceduralRig?.getAllBoneNames() ?? cur.boneNames;
+      rebuildJointHandles(refs, loadedBones, cur.rigSettings);
 
       const helper = new THREE.SkeletonHelper(inst.modelRoot);
       const helperMat = helper.material as THREE.LineBasicMaterial;
@@ -1247,8 +1312,23 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
       helperMat.opacity = 0.9;
       helper.renderOrder = 998;
       helper.visible = cur.showSkeleton;
-      liveRefs.skeletonHelper = helper;
-      liveRefs.scene.add(helper);
+      refs.skeletonHelper = helper;
+      refs.scene.add(helper);
+
+      // Scale turntable smoothly for large dragons vs compact critters
+      const stageRadius = runtime ? Math.max(1.0, Math.min(4.8, runtime.radius)) : 1.0;
+      const floorScale = stageRadius > 1.4 ? stageRadius / 1.45 : 1.0;
+      refs.floorMesh.scale.set(floorScale, 1, floorScale);
+      refs.gridHelper.scale.set(floorScale, 1, floorScale);
+      refs.arrowMesh.position.set(0, 0.012, 1.32 * floorScale);
+      refs.controls.maxDistance = Math.max(12, stageRadius * 6);
+      refs.controls.minDistance = Math.max(0.6, stageRadius * 0.45);
+
+      if (runtime) {
+        const framed = computeCameraVectorsForBounds(runtime.boundsCenter, runtime.radius, cameraPreset);
+        refs.camGoalPos = framed.pos;
+        refs.camGoalTarget = framed.target;
+      }
 
       applyXrayToInstance(inst, cur.xrayMesh);
       inst.setAction(cur.previewSlot, 0.05);
@@ -1264,54 +1344,134 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
             cur.ghostStartPose.bones,
             cur.ghostStartPose.hipsOffsetY
           );
-        liveRefs.ghostLines.geometry.setAttribute(
+        refs.ghostLines.geometry.setAttribute(
           'position',
           new THREE.Float32BufferAttribute(linePositions, 3)
         );
-        liveRefs.ghostLines.geometry.computeBoundingSphere();
-        liveRefs.ghostLines.visible = linePositions.length > 0;
-        liveRefs.ghostPoints.geometry.setAttribute(
+        refs.ghostLines.geometry.computeBoundingSphere();
+        refs.ghostLines.visible = linePositions.length > 0;
+        refs.ghostPoints.geometry.setAttribute(
           'position',
           new THREE.Float32BufferAttribute(jointPositions, 3)
         );
-        liveRefs.ghostPoints.geometry.computeBoundingSphere();
-        liveRefs.ghostPoints.visible = jointPositions.length > 0;
+        refs.ghostPoints.geometry.computeBoundingSphere();
+        refs.ghostPoints.visible = jointPositions.length > 0;
       }
-      syncOnionSkins(liveRefs, asset, cur.rigSettings, cur.onionSkin, cur.poseMode, cur.motionPlaying);
-    });
+      if (legacyAsset) {
+        syncOnionSkins(refs, legacyAsset, cur.rigSettings, cur.onionSkin, cur.poseMode, cur.motionPlaying);
+      }
+
+      if (runtime) {
+        cur.onRuntimeReady?.({
+          boneNames: loadedBones,
+          rigSettings: inst.rigSettings,
+          archetype: runtime.archetype,
+          hipsHeightRef: runtime.hipsHeightRef,
+          hasTelegraph: Boolean(runtime.telegraphGroup),
+          hasHeroProps: Boolean(runtime.heroRig && runtime.descriptor.target.kind === 'builtInHero'),
+        });
+      }
+    };
+
+    if (actorTarget) {
+      const prepare = async () => {
+        if (actorTarget.kind === 'customAsset') {
+          const meta = customAssets.find((a) => a.id === actorTarget.assetId) ?? asset;
+          await loadCustomAssetToCache(actorTarget.assetId, meta?.category ?? 'character');
+        }
+        if (cancelled || !stageRef.current) return;
+
+        const actors = listStudioActors(project, currentLevel, customAssets);
+        const key = describeTargetKey(actorTarget);
+        const descriptor: StudioActorDescriptor =
+          actors.find((d) => describeTargetKey(d.target) === key) ?? {
+            id: key,
+            label: actorTarget.label,
+            subtitle: '',
+            category: actorTarget.category,
+            archetype:
+              actorTarget.kind === 'monsterBlueprint'
+                ? 'quadruped'
+                : actorTarget.kind === 'buddyCritter'
+                ? 'critter'
+                : actorTarget.kind === 'proceduralBaddie'
+                ? 'baddie'
+                : 'humanoid',
+            target: actorTarget,
+            entityId: 'entityId' in actorTarget ? actorTarget.entityId : undefined,
+          };
+
+        const runtime = instantiateStudioActor(
+          descriptor,
+          project,
+          currentLevel,
+          customAssets,
+          stateRef.current.contextProps
+        );
+        if (!runtime) return;
+        mountLoadedInstance(runtime.instance, runtime, runtime.assetMeta ?? null);
+      };
+      void prepare();
+    } else if (asset) {
+      void loadCustomAssetToCache(asset.id, asset.category).then(() => {
+        if (cancelled || !stageRef.current) return;
+        const cur = stateRef.current;
+        const inst = instantiateCustomModel(asset.id, {
+          ...asset,
+          rigSettings: cur.rigSettings,
+        });
+        if (!inst) return;
+        mountLoadedInstance(inst, null, asset);
+      });
+    }
 
     return () => {
       cancelled = true;
     };
-  }, [asset.id, asset.category, clipMapSignature]);
+  }, [actorTargetKey, asset?.id, asset?.category, clipMapSignature]);
 
   // 3. Zero-flicker live updates
   useEffect(() => {
     const refs = stageRef.current;
     if (!refs?.instance) return;
-    const cached = getCachedAssetSync(asset.id);
-    if (cached) {
-      const scale = asset.defaultScale;
-      const baseNormalizedY = (cached.baseGroundOffset / Math.max(0.0001, cached.baseScale)) * scale;
-      const userGroundDelta = asset.groundOffset - cached.baseGroundOffset;
-      refs.instance.scaledRoot.scale.setScalar(scale);
-      refs.instance.scaledRoot.position.y = baseNormalizedY + userGroundDelta;
+    if (asset && (!actorTarget || actorTarget.kind === 'customAsset')) {
+      const cached = getCachedAssetSync(asset.id);
+      if (cached) {
+        const scale = asset.defaultScale;
+        const baseNormalizedY = (cached.baseGroundOffset / Math.max(0.0001, cached.baseScale)) * scale;
+        const userGroundDelta = asset.groundOffset - cached.baseGroundOffset;
+        refs.instance.scaledRoot.scale.setScalar(scale);
+        refs.instance.scaledRoot.position.y = baseNormalizedY + userGroundDelta;
+      }
+      refs.instance.setAnimSpeed(asset.animSpeed);
+      refs.instance.applyRigSettings(rigSettings);
+      refs.instance.setCustomAnimations(asset.customAnimations, asset.defaultSlotPresets);
+    } else {
+      refs.instance.applyRigSettings(rigSettings);
     }
-    refs.instance.setAnimSpeed(asset.animSpeed);
-    refs.instance.applyRigSettings(rigSettings);
-    refs.instance.setCustomAnimations(asset.customAnimations, asset.defaultSlotPresets);
     if (stateRef.current.paused) {
       refs.instance.update(0, 1);
     }
   }, [
-    asset.id,
-    asset.defaultScale,
-    asset.groundOffset,
-    asset.animSpeed,
-    asset.customAnimations,
-    asset.defaultSlotPresets,
+    actorTargetKey,
+    asset?.id,
+    asset?.defaultScale,
+    asset?.groundOffset,
+    asset?.animSpeed,
+    asset?.customAnimations,
+    asset?.defaultSlotPresets,
     rigSettings,
   ]);
+
+  // Live toggle context props (Hero Sword/Shield/Axe + Enemy Telegraph ring)
+  useEffect(() => {
+    const rt = stageRef.current?.studioRuntime;
+    if (!rt) return;
+    applyContextPropsToHeroRig(rt.heroRig, contextProps);
+    if (rt.telegraphGroup) {
+      rt.telegraphGroup.visible = Boolean(contextProps?.showTelegraph);
+    }
+  }, [contextProps?.weapon, contextProps?.shield, contextProps?.showTelegraph]);
 
   useEffect(() => {
     const refs = stageRef.current;
@@ -1354,19 +1514,20 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
     );
     refs.ghostPoints.geometry.computeBoundingSphere();
     refs.ghostPoints.visible = jointPositions.length > 0;
-  }, [ghostStartPose, asset.defaultScale, asset.groundOffset, rigSettings.facingOffsetDeg]);
+  }, [ghostStartPose, asset?.defaultScale, asset?.groundOffset, rigSettings.facingOffsetDeg]);
 
   useEffect(() => {
     const refs = stageRef.current;
-    if (!refs) return;
+    if (!refs || !asset || (actorTarget && actorTarget.kind !== 'customAsset')) return;
     syncOnionSkins(refs, asset, rigSettings, onionSkin, poseMode, motionPlaying);
   }, [
+    actorTargetKey,
     onionSkin,
     poseMode,
     motionPlaying,
-    asset.id,
-    asset.defaultScale,
-    asset.groundOffset,
+    asset?.id,
+    asset?.defaultScale,
+    asset?.groundOffset,
     rigSettings,
   ]);
 
@@ -1384,10 +1545,17 @@ export const RigPreviewStage: React.FC<RigPreviewStageProps> = ({
     applyXrayToInstance(refs.instance, xrayMesh);
   }, [xrayMesh]);
 
-  // 4. Camera angle presets
+  // 4. Camera angle presets (proportional to loaded actor size)
   useEffect(() => {
     const refs = stageRef.current;
     if (!refs || cameraResetNonce === 0) return;
+    const rt = refs.studioRuntime;
+    if (rt) {
+      const framed = computeCameraVectorsForBounds(rt.boundsCenter, rt.radius, cameraPreset);
+      refs.camGoalPos = framed.pos;
+      refs.camGoalTarget = framed.target;
+      return;
+    }
     refs.camGoalTarget = new THREE.Vector3(0, 0.95, 0);
     if (cameraPreset === 'front') {
       refs.camGoalPos = new THREE.Vector3(0, 1.35, 3.5);

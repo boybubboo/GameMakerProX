@@ -40,8 +40,9 @@ export function attachChestGoldenGlow(
     side: THREE.DoubleSide,
     toneMapped: false,
   });
+  innerGlowMat.userData = { preserveGlowMat: true };
   const innerGlowMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(innerW, innerD),
+    new THREE.PlaneGeometry(innerW * 1.04, innerD * 1.04),
     innerGlowMat
   );
   innerGlowMesh.name = 'Chest_Gold_Glow_Core';
@@ -67,14 +68,16 @@ export function attachChestGoldenGlow(
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     side: THREE.DoubleSide,
+    toneMapped: false,
   });
+  beamConeMat.userData = { preserveGlowMat: true };
   auraMats.push(beamConeMat);
   const beamCone = new THREE.Mesh(
-    new THREE.CylinderGeometry(innerW * 0.72, innerW * 0.42, 0.88, 16, 1, true),
+    new THREE.CylinderGeometry(innerW * 0.78, innerW * 0.44, 1.05, 16, 1, true),
     beamConeMat
   );
-  beamCone.position.set(0, 0.44, 0);
-  beamCone.scale.set(1, 1, Math.max(0.65, innerD / Math.max(0.1, innerW)));
+  beamCone.position.set(0, 0.52, 0);
+  beamCone.scale.set(1, 1, Math.max(0.68, innerD / Math.max(0.1, innerW)));
   auraGroup.add(beamCone);
 
   // Soft crossed rising gold rays
@@ -86,13 +89,15 @@ export function attachChestGoldenGlow(
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       side: THREE.DoubleSide,
+      toneMapped: false,
     });
+    rayMat.userData = { preserveGlowMat: true };
     auraMats.push(rayMat);
     const ray = new THREE.Mesh(
-      new THREE.PlaneGeometry(innerW * 1.12, 0.96),
+      new THREE.PlaneGeometry(innerW * 1.18, 1.15),
       rayMat
     );
-    ray.position.set(0, 0.48, 0);
+    ray.position.set(0, 0.56, 0);
     ray.rotation.y = ry;
     auraGroup.add(ray);
   }
@@ -105,17 +110,19 @@ export function attachChestGoldenGlow(
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     side: THREE.DoubleSide,
+    toneMapped: false,
   });
+  haloMat.userData = { preserveGlowMat: true };
   auraMats.push(haloMat);
-  const halo = new THREE.Mesh(new THREE.CircleGeometry(innerW * 0.65, 20), haloMat);
+  const halo = new THREE.Mesh(new THREE.CircleGeometry(innerW * 0.72, 20), haloMat);
   halo.rotation.x = -Math.PI / 2;
   halo.position.set(0, 0.06, 0);
   auraGroup.add(halo);
 
   parentGroup.add(auraGroup);
 
-  const glowLight = new THREE.PointLight('#FFD24C', 0, 6.2, 1.55);
-  glowLight.position.set(0, mouthY + 0.36, 0.06);
+  const glowLight = new THREE.PointLight('#FFD24C', 0, 7.2, 1.45);
+  glowLight.position.set(0, mouthY + 0.4, 0.06);
   glowLight.userData.ignoreInHierarchy = true;
   parentGroup.add(glowLight);
 
@@ -128,12 +135,110 @@ export function attachChestGoldenGlow(
     glowLight,
     openProgress: 0,
     opening: false,
-    openDuration: 0.95,
+    openDuration: 1.05,
     openElapsed: 0,
     useMechController,
   };
   parentGroup.userData.chestAnim = rig;
   return rig;
+}
+
+const _chestPivotOffset = new THREE.Vector3();
+const _chestPivotOrigin = new THREE.Vector3(0, 0.56, -0.38);
+
+/**
+ * Advances a treasure chest's spring-open lid animation and radiant interior gold glow.
+ * Returns true on the exact frame the opening animation finishes.
+ */
+export function updateTreasureChestRig(
+  rig: TreasureChestAnimRig,
+  dt: number,
+  elapsedSec: number,
+  hasRemainingLoot: boolean,
+  externalProgress?: number
+): boolean {
+  let justFinished = false;
+  const clampedDt = Math.min(0.08, Math.max(0, dt));
+
+  if (rig.opening) {
+    rig.openElapsed += clampedDt;
+    const rawT = Math.min(1, rig.openElapsed / Math.max(0.2, rig.openDuration));
+    rig.openProgress = rawT;
+    if (rawT >= 1) {
+      rig.opening = false;
+      rig.openProgress = 1;
+      justFinished = true;
+    }
+  } else if (typeof externalProgress === 'number') {
+    rig.openProgress = THREE.MathUtils.clamp(externalProgress, 0, 1);
+  }
+
+  const p = rig.openProgress;
+
+  // Drive lid hinge if not already driven by MechanismRuntimeController
+  if (typeof externalProgress !== 'number' && rig.lidPivot) {
+    const lidT = THREE.MathUtils.clamp(p / 0.84, 0, 1);
+    const easedLid = evaluateMotionEasing('elastic', lidT);
+    const angleRad = THREE.MathUtils.degToRad(-108 * easedLid);
+    if (!rig.useMechController) {
+      rig.lidPivot.rotation.x = angleRad;
+    } else {
+      _chestPivotOffset.set(0, 0, 0).sub(_chestPivotOrigin);
+      _chestPivotOffset.applyAxisAngle(new THREE.Vector3(1, 0, 0), angleRad);
+      rig.lidPivot.position.copy(_chestPivotOrigin).add(_chestPivotOffset);
+      rig.lidPivot.rotation.set(angleRad, 0, 0);
+    }
+  }
+
+  // Interior pure bright gold glow (hides interior so no fixed contents are visible)
+  const coreVisible = p > 0.04;
+  rig.innerGlowMesh.visible = coreVisible;
+  if (coreVisible) {
+    const coreRamp = THREE.MathUtils.clamp((p - 0.04) / 0.24, 0, 1);
+    const shimmer = 0.94 + 0.06 * Math.sin(elapsedSec * 5.2);
+    rig.innerGlowMat.opacity = coreRamp * (hasRemainingLoot ? 1.0 : 0.72) * shimmer;
+  } else {
+    rig.innerGlowMat.opacity = 0;
+  }
+
+  // Rising golden aura beams & halo
+  const auraVisible = p > 0.08;
+  rig.auraGroup.visible = auraVisible;
+  if (auraVisible) {
+    const auraRamp = THREE.MathUtils.clamp((p - 0.08) / 0.32, 0, 1);
+    const burstBoost = rig.opening ? 1 + 0.45 * Math.sin(Math.min(1, p) * Math.PI) : 1;
+    const targetScaleY = auraRamp * (hasRemainingLoot ? 1.0 : 0.55) * burstBoost;
+    const pulse = 1 + 0.05 * Math.sin(elapsedSec * 4.4);
+    rig.auraGroup.scale.set(
+      (0.5 + 0.5 * auraRamp) * pulse,
+      Math.max(0.05, targetScaleY),
+      (0.5 + 0.5 * auraRamp) * pulse
+    );
+    rig.auraGroup.rotation.y += clampedDt * 0.55;
+
+    const lootMult = hasRemainingLoot ? 1.0 : 0.34;
+    const baseAlpha = auraRamp * lootMult * burstBoost;
+    const shimmer = 0.9 + 0.1 * Math.sin(elapsedSec * 6.1);
+    if (rig.auraMats[0]) rig.auraMats[0].opacity = Math.min(0.75, 0.42 * baseAlpha * shimmer);
+    for (let i = 1; i <= 3; i++) {
+      if (rig.auraMats[i]) rig.auraMats[i].opacity = Math.min(0.75, 0.38 * baseAlpha * shimmer);
+    }
+    if (rig.auraMats[4]) rig.auraMats[4].opacity = Math.min(0.85, 0.62 * baseAlpha * shimmer);
+  } else {
+    for (const m of rig.auraMats) m.opacity = 0;
+  }
+
+  // Dynamic golden PointLight illuminating chest & hero
+  if (p > 0.04) {
+    const lightPulse = 0.92 + 0.08 * Math.sin(elapsedSec * 5.0);
+    const peakBurst = rig.opening ? 3.8 * Math.sin(Math.min(1, p) * Math.PI) : 0;
+    const steadyGlow = hasRemainingLoot ? 3.4 : 0.95;
+    rig.glowLight.intensity = (steadyGlow * THREE.MathUtils.clamp(p * 1.4, 0, 1) + peakBurst) * lightPulse;
+  } else {
+    rig.glowLight.intensity = 0;
+  }
+
+  return justFinished;
 }
 
 export interface ObjectPartNode {

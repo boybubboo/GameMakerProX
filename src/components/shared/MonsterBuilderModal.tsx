@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import type { MakerStore } from '../../store/useMakerStore';
 import type {
+  BaddieWindupClueStyle,
   CharacterEyePupilStyle,
   CharacterMaterialFinish,
   CharacterSurfaceCoatMode,
@@ -41,6 +42,7 @@ import type {
   MonsterTeethStyle,
   MonsterWingStyle,
 } from '../../types/maker';
+import { WINDUP_CLUE_OPTIONS } from '../../data/baddieActionLibrary';
 import {
   createMakerRenderer,
   detectSoftwareGl,
@@ -431,6 +433,7 @@ export const MonsterBuilderModal: React.FC<MonsterBuilderModalProps> = ({
     secondaryAttack: bp.secondaryAttack,
     mouthMood: bp.mouth.mood,
     eyebrowMood: bp.eyebrows.mood,
+    windupClueStyle: bp.baddieAI?.windupClueStyle,
   });
   latestRef.current = {
     action: previewAction,
@@ -442,6 +445,7 @@ export const MonsterBuilderModal: React.FC<MonsterBuilderModalProps> = ({
     secondaryAttack: bp.secondaryAttack,
     mouthMood: bp.mouth.mood,
     eyebrowMood: bp.eyebrows.mood,
+    windupClueStyle: bp.baddieAI?.windupClueStyle,
   };
 
   const pushHistoryUpdate = useCallback(
@@ -713,7 +717,9 @@ export const MonsterBuilderModal: React.FC<MonsterBuilderModalProps> = ({
             0,
             attackForFrame,
             cur.mouthMood,
-            cur.eyebrowMood
+            cur.eyebrowMood,
+            0,
+            cur.windupClueStyle
           );
         }
 
@@ -1936,10 +1942,138 @@ export const MonsterBuilderModal: React.FC<MonsterBuilderModalProps> = ({
             {/* Combat Tuning & Dialogue */}
             <div className="grid grid-cols-2 gap-x-3 gap-y-2">
               <SliderRow label="Attack Power" value={bp.attackPower} min={1} max={5} step={1} decimals={0} onChange={(v) => patchBp({ attackPower: v })} />
-              <SliderRow label="Attack Range" value={bp.attackRange} min={1.8} max={9.5} step={0.2} unit="m" decimals={1} onChange={(v) => patchBp({ attackRange: v })} />
+              <SliderRow label="Attack Range" value={bp.attackRange} min={1.8} max={12.5} step={0.2} unit="m" decimals={1} onChange={(v) => patchBp({ attackRange: v })} />
               <SliderRow label="Move Cooldown" value={bp.attackCooldown} min={0.6} max={3.2} step={0.1} unit="s" decimals={1} onChange={(v) => patchBp({ attackCooldown: v })} />
-              <SliderRow label="Health" value={bp.health ?? 5} min={1} max={25} step={1} decimals={0} onChange={(v) => patchBp({ health: v })} />
+              <SliderRow label="Health" value={bp.health ?? 5} min={1} max={40} step={1} decimals={0} onChange={(v) => patchBp({ health: v })} />
               <SliderRow label="Speed" value={bp.speed ?? 4} min={1} max={8} step={1} decimals={0} onChange={(v) => patchBp({ speed: v })} />
+              <SliderRow
+                label="Action Variety"
+                value={bp.baddieAI?.varietyFactor ?? 0.65}
+                min={0}
+                max={1}
+                step={0.05}
+                decimals={2}
+                onChange={(v) =>
+                  patchBp({
+                    baddieAI: {
+                      detectionMode: bp.baddieAI?.detectionMode ?? 'both',
+                      aggroRange: bp.baddieAI?.aggroRange ?? 26,
+                      sightAngleDeg: bp.baddieAI?.sightAngleDeg ?? 130,
+                      territoryRadius: bp.baddieAI?.territoryRadius ?? 22,
+                      patrolPattern: bp.baddieAI?.patrolPattern ?? 'orbit',
+                      flightPattern: bp.baddieAI?.flightPattern ?? 'figure8',
+                      flightAltitude: bp.baddieAI?.flightAltitude ?? (bp.canFly ? 4.0 : 0),
+                      hoverAttackHeight: bp.baddieAI?.hoverAttackHeight ?? (bp.canFly ? 2.5 : 0),
+                      primaryAction: bp.primaryAttack,
+                      secondaryAction: bp.secondaryAttack,
+                      ...bp.baddieAI,
+                      varietyFactor: v,
+                    },
+                  })
+                }
+              />
+              {bp.canFly && (
+                <SliderRow
+                  label="Flight Altitude"
+                  value={bp.baddieAI?.flightAltitude ?? 4.0}
+                  min={1.2}
+                  max={9.0}
+                  step={0.2}
+                  unit="m"
+                  decimals={1}
+                  onChange={(v) =>
+                    patchBp({
+                      baddieAI: {
+                        detectionMode: bp.baddieAI?.detectionMode ?? 'both',
+                        aggroRange: bp.baddieAI?.aggroRange ?? 26,
+                        sightAngleDeg: bp.baddieAI?.sightAngleDeg ?? 130,
+                        territoryRadius: bp.baddieAI?.territoryRadius ?? 22,
+                        patrolPattern: bp.baddieAI?.patrolPattern ?? 'orbit',
+                        flightPattern: bp.baddieAI?.flightPattern ?? 'figure8',
+                        hoverAttackHeight: bp.baddieAI?.hoverAttackHeight ?? 2.5,
+                        varietyFactor: bp.baddieAI?.varietyFactor ?? 0.65,
+                        primaryAction: bp.primaryAttack,
+                        secondaryAction: bp.secondaryAttack,
+                        ...bp.baddieAI,
+                        flightAltitude: v,
+                      },
+                    })
+                  }
+                />
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <div>
+                <div className="text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">
+                  Pre-Attack Windup Clue
+                </div>
+                <select
+                  value={bp.baddieAI?.windupClueStyle ?? 'auto'}
+                  onChange={(e) =>
+                    patchBp({
+                      baddieAI: {
+                        detectionMode: bp.baddieAI?.detectionMode ?? 'both',
+                        aggroRange: bp.baddieAI?.aggroRange ?? 26,
+                        sightAngleDeg: bp.baddieAI?.sightAngleDeg ?? 130,
+                        territoryRadius: bp.baddieAI?.territoryRadius ?? 22,
+                        patrolPattern: bp.baddieAI?.patrolPattern ?? 'orbit',
+                        flightPattern: bp.baddieAI?.flightPattern ?? 'figure8',
+                        flightAltitude: bp.baddieAI?.flightAltitude ?? (bp.canFly ? 4.0 : 0),
+                        hoverAttackHeight: bp.baddieAI?.hoverAttackHeight ?? (bp.canFly ? 2.5 : 0),
+                        varietyFactor: bp.baddieAI?.varietyFactor ?? 0.65,
+                        primaryAction: bp.primaryAttack,
+                        secondaryAction: bp.secondaryAttack,
+                        ...bp.baddieAI,
+                        windupClueStyle: e.target.value as BaddieWindupClueStyle,
+                      },
+                    })
+                  }
+                  className="w-full h-8 px-2.5 rounded-lg border border-slate-200 dark:border-white/15 bg-white dark:bg-[#191E2B] text-xs font-medium text-slate-800 dark:text-slate-100"
+                >
+                  {WINDUP_CLUE_OPTIONS.map((o) => (
+                    <option key={o.id} value={o.id}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {bp.canFly && (
+                <label className="flex items-center justify-between gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 cursor-pointer">
+                  <div>
+                    <div className="text-xs font-semibold text-sky-700 dark:text-sky-300">
+                      Land Between Air Attacks
+                    </div>
+                    <div className="text-[10px] text-sky-600/80 dark:text-sky-300/70">
+                      Performs 1 aerial attack, hovers briefly, then lands before attacking again
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={bp.baddieAI?.landAfterAirAttack !== false}
+                    onChange={(e) =>
+                      patchBp({
+                        baddieAI: {
+                          detectionMode: bp.baddieAI?.detectionMode ?? 'both',
+                          aggroRange: bp.baddieAI?.aggroRange ?? 26,
+                          sightAngleDeg: bp.baddieAI?.sightAngleDeg ?? 130,
+                          territoryRadius: bp.baddieAI?.territoryRadius ?? 22,
+                          patrolPattern: bp.baddieAI?.patrolPattern ?? 'orbit',
+                          flightPattern: bp.baddieAI?.flightPattern ?? 'figure8',
+                          flightAltitude: bp.baddieAI?.flightAltitude ?? 4.0,
+                          hoverAttackHeight: bp.baddieAI?.hoverAttackHeight ?? 2.5,
+                          varietyFactor: bp.baddieAI?.varietyFactor ?? 0.65,
+                          primaryAction: bp.primaryAttack,
+                          secondaryAction: bp.secondaryAttack,
+                          ...bp.baddieAI,
+                          landAfterAirAttack: e.target.checked,
+                        },
+                      })
+                    }
+                    className="w-4 h-4 accent-sky-500 shrink-0"
+                  />
+                </label>
+              )}
             </div>
             <div>
               <div className="text-[11px] font-medium text-slate-600 dark:text-slate-300 mb-1">

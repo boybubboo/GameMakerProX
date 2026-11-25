@@ -113,13 +113,43 @@ const SLOT_OPTIONS: { slot: CustomClipSlot; label: string }[] = [
 export interface QuickJointItem {
   boneName: string;
   label: string;
-  group: 'core' | 'arms' | 'legs';
+  group: 'core' | 'arms' | 'legs' | 'wings' | 'tail';
 }
 
 export function getFriendlyBoneLabel(
   boneName: string,
   boneMap: Partial<Record<RigBoneRole, string>>
 ): string {
+  // Quadruped & Procedural Creature / Baddie readable names first
+  if (boneName === 'MonsterBodyPivot') return 'Body Pivot';
+  if (boneName === 'MonsterChest') return 'Front Chest';
+  if (boneName === 'MonsterTorso') return 'Mid Torso';
+  if (boneName === 'MonsterHips') return 'Rear Hips';
+  const neckMatch = /^MonsterNeck_(\d+)_(\d+)$/.exec(boneName);
+  if (neckMatch) {
+    const h = Number(neckMatch[1]) + 1;
+    const s = Number(neckMatch[2]) + 1;
+    return `Neck ${h}.${s}`;
+  }
+  const headMatch = /^MonsterHead_(\d+)$/.exec(boneName);
+  if (headMatch) return `Head ${Number(headMatch[1]) + 1}`;
+  const jawMatch = /^MonsterJaw_(\d+)$/.exec(boneName);
+  if (jawMatch) return `Jaw ${Number(jawMatch[1]) + 1}`;
+  const legMatch = /^Leg_(\d+)_([LR])_(Hip|Knee|Paw)$/.exec(boneName);
+  if (legMatch) {
+    const pairLabel = legMatch[1] === '0' ? 'Front' : 'Back';
+    return `${legMatch[2]} ${pairLabel} ${legMatch[3]}`;
+  }
+  const tailMatch = /^MonsterTail_(\d+)$/.exec(boneName);
+  if (tailMatch) return `Tail ${Number(tailMatch[1]) + 1}`;
+  if (boneName === 'Wing_L_Inner') return 'L Wing Inner';
+  if (boneName === 'Wing_L_Outer') return 'L Wing Tip';
+  if (boneName === 'Wing_R_Inner') return 'R Wing Inner';
+  if (boneName === 'Wing_R_Outer') return 'R Wing Tip';
+  if (boneName === 'LeftWing') return 'L Wing';
+  if (boneName === 'RightWing') return 'R Wing';
+  if (boneName === 'Tail') return 'Tail';
+
   for (const meta of RIG_BONE_ROLES) {
     if (boneMap[meta.role] === boneName) {
       return meta.label
@@ -146,13 +176,57 @@ export function buildQuickJointList(
   const items: QuickJointItem[] = [];
   const seen = new Set<string>();
 
-  const push = (boneName: string | undefined, label: string, group: 'core' | 'arms' | 'legs') => {
+  const push = (
+    boneName: string | undefined,
+    label: string,
+    group: QuickJointItem['group']
+  ) => {
     if (!boneName || seen.has(boneName) || !boneNames.includes(boneName)) return;
     seen.add(boneName);
     items.push({ boneName, label, group });
   };
 
-  // Core
+  const isQuadruped = boneNames.some(
+    (b) => b === 'MonsterChest' || b.startsWith('Leg_0_') || b.startsWith('MonsterHead_')
+  );
+
+  if (isQuadruped) {
+    push('MonsterHead_0', 'Head 1', 'core');
+    push('MonsterJaw_0', 'Jaw 1', 'core');
+    push('MonsterHead_1', 'Head 2', 'core');
+    push('MonsterJaw_1', 'Jaw 2', 'core');
+    push('MonsterNeck_0_0', 'Neck 1 Base', 'core');
+    push('MonsterNeck_0_1', 'Neck 1 Mid', 'core');
+    push('MonsterNeck_1_0', 'Neck 2 Base', 'core');
+    push('MonsterNeck_1_1', 'Neck 2 Mid', 'core');
+    push('MonsterChest', 'Front Chest', 'core');
+    push('MonsterTorso', 'Mid Torso', 'core');
+    push('MonsterHips', 'Rear Hips', 'core');
+    push('MonsterBodyPivot', 'Body Pivot', 'core');
+
+    // Wings
+    push('Wing_L_Inner', 'L Wing Inner', 'wings');
+    push('Wing_L_Outer', 'L Wing Tip', 'wings');
+    push('Wing_R_Inner', 'R Wing Inner', 'wings');
+    push('Wing_R_Outer', 'R Wing Tip', 'wings');
+
+    // Quadruped Front & Hind Legs
+    for (const pair of [0, 1]) {
+      const pfx = pair === 0 ? 'Front' : 'Back';
+      push(`Leg_${pair}_L_Hip`, `L ${pfx} Hip`, 'legs');
+      push(`Leg_${pair}_L_Knee`, `L ${pfx} Knee`, 'legs');
+      push(`Leg_${pair}_R_Hip`, `R ${pfx} Hip`, 'legs');
+      push(`Leg_${pair}_R_Knee`, `R ${pfx} Knee`, 'legs');
+    }
+
+    // Tail Chain
+    for (let i = 0; i < 6; i++) {
+      push(`MonsterTail_${i}`, `Tail ${i + 1}`, 'tail');
+    }
+    return items;
+  }
+
+  // Humanoid / Critter / Procedural Baddie
   push(boneMap.head, 'Head', 'core');
   push(boneMap.neck, 'Neck', 'core');
   push(boneMap.chest, 'Chest', 'core');
@@ -189,10 +263,19 @@ export function buildQuickJointList(
   );
   push(rightFoot, 'R Foot', 'legs');
 
+  // Hybrid critter/flyer Wings & Tail
+  const leftWing = boneNames.find((b) => !seen.has(b) && /^(leftwing|wing_l)$/i.test(b));
+  const rightWing = boneNames.find((b) => !seen.has(b) && /^(rightwing|wing_r)$/i.test(b));
+  push(leftWing, 'L Wing', 'wings');
+  push(rightWing, 'R Wing', 'wings');
+
+  const tail = boneNames.find((b) => !seen.has(b) && /^tail$/i.test(b));
+  push(tail, 'Tail', 'tail');
+
   return items;
 }
 
-function buildSymmetryMaps(
+export function buildSymmetryMaps(
   boneNames: string[],
   boneMap: Partial<Record<RigBoneRole, string>>
 ): { pairMap: Map<string, string>; sideMap: Map<string, 'left' | 'right'> } {
@@ -215,7 +298,31 @@ function buildSymmetryMaps(
     }
   }
 
-  // Also match left/right hands, feet, shoulders, clavicles, fingers by name symmetry
+  // Also match left/right hands, feet, wings, quadruped legs & dual dragon heads/necks
+  const extraPairs: [string, string][] = [
+    ['LeftWing', 'RightWing'],
+    ['Wing_L_Inner', 'Wing_R_Inner'],
+    ['Wing_L_Outer', 'Wing_R_Outer'],
+    ['MonsterHead_0', 'MonsterHead_1'],
+    ['MonsterJaw_0', 'MonsterJaw_1'],
+    ['MonsterNeck_0_0', 'MonsterNeck_1_0'],
+    ['MonsterNeck_0_1', 'MonsterNeck_1_1'],
+    ['Leg_0_L_Hip', 'Leg_0_R_Hip'],
+    ['Leg_0_L_Knee', 'Leg_0_R_Knee'],
+    ['Leg_0_L_Paw', 'Leg_0_R_Paw'],
+    ['Leg_1_L_Hip', 'Leg_1_R_Hip'],
+    ['Leg_1_L_Knee', 'Leg_1_R_Knee'],
+    ['Leg_1_L_Paw', 'Leg_1_R_Paw'],
+  ];
+  for (const [lName, rName] of extraPairs) {
+    if (boneNames.includes(lName) && boneNames.includes(rName)) {
+      pairMap.set(lName, rName);
+      pairMap.set(rName, lName);
+      sideMap.set(lName, 'left');
+      sideMap.set(rName, 'right');
+    }
+  }
+
   for (const name of boneNames) {
     if (pairMap.has(name)) continue;
     let counterpart: string | null = null;
@@ -804,6 +911,8 @@ export const MotionEditorPanel: React.FC<MotionEditorProps> = ({
                 ['core', 'Head & Torso'],
                 ['arms', 'Arms & Hands'],
                 ['legs', 'Legs & Feet'],
+                ['wings', 'Wings'],
+                ['tail', 'Tail'],
               ] as const
             ).map(([grp, title]) => {
               const items = quickJoints.filter((q) => q.group === grp);

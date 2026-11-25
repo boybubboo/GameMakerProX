@@ -82,17 +82,27 @@ export function buildContextualStats(
       value: `+${item.defenseBonus ?? 0} DEF`,
       accent: '#38BDF8',
     });
-    rows.push({
-      label: l2 || 'Vitality',
-      value: item.maxHealthBonus ? `+${item.maxHealthBonus} Max HP` : 'Standard',
-      accent: '#F2545B',
-    });
+    if (item.wearSlot === 'offhand' || typeof item.blockReduction === 'number') {
+      rows.push({
+        label: l2 || 'Guard Block',
+        value: `${Math.round((item.blockReduction ?? 0.65) * 100)}% DMG`,
+        accent: '#60A5FA',
+      });
+    } else {
+      rows.push({
+        label: l2 || 'Vitality',
+        value: item.maxHealthBonus ? `+${item.maxHealthBonus} Max HP` : 'Standard',
+        accent: '#F2545B',
+      });
+    }
     rows.push({
       label: l3 || 'Agility',
       value: item.speedBonus
         ? `+${Math.round(item.speedBonus * 100)}% SPD`
         : item.attackBonus
         ? `+${item.attackBonus} ATK`
+        : item.wearSlot === 'offhand'
+        ? 'Off-Hand'
         : item.wearSlot ?? 'Equip',
       accent: '#20B46A',
     });

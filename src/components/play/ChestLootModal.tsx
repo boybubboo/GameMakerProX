@@ -64,6 +64,12 @@ export const ChestLootModal: React.FC<ChestLootModalProps> = ({
     setSelectedIndex((prev) => (prev + delta + entries.length) % entries.length);
   };
 
+  const mountedAtRef = useRef<number>(typeof performance !== 'undefined' ? performance.now() : 0);
+
+  useEffect(() => {
+    mountedAtRef.current = typeof performance !== 'undefined' ? performance.now() : 0;
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'ArrowUp' || e.code === 'ArrowLeft' || e.code === 'KeyW' || e.code === 'KeyA') {
@@ -82,9 +88,12 @@ export const ChestLootModal: React.FC<ChestLootModalProps> = ({
         }
         return;
       }
+      const justMounted =
+        typeof performance !== 'undefined' && performance.now() - mountedAtRef.current < 140;
       if ((e.code === 'Enter' || e.code === 'Space' || e.code === 'KeyE') && !e.repeat) {
         e.preventDefault();
         e.stopPropagation();
+        if (justMounted) return;
         const target = entries[selectedIndex] ?? entries[0];
         if (target) onTakeEntry(target.uid);
         return;
@@ -92,6 +101,7 @@ export const ChestLootModal: React.FC<ChestLootModalProps> = ({
       if ((e.code === 'KeyF' || e.code === 'KeyT') && !e.repeat) {
         e.preventDefault();
         e.stopPropagation();
+        if (justMounted) return;
         if (entries.length > 0) onTakeAll();
         return;
       }

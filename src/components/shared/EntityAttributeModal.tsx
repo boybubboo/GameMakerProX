@@ -16,14 +16,29 @@ import {
   PresetLibrary,
   getProjectInventoryItems,
 } from '../../data/registries';
+import {
+  BADDIE_ACTION_BY_ID,
+  BADDIE_ACTION_LIBRARY,
+  DETECTION_MODE_OPTIONS,
+  FLIGHT_PATTERN_OPTIONS,
+  PATROL_PATTERN_OPTIONS,
+  WINDUP_CLUE_OPTIONS,
+  resolveBaddieAIConfig,
+} from '../../data/baddieActionLibrary';
 import type { MakerStore } from '../../store/useMakerStore';
 import type {
+  BaddieAIConfig,
+  BaddieDetectionMode,
+  BaddieFlightPattern,
+  BaddiePatrolPattern,
+  BaddieWindupClueStyle,
   CreatureBodyId,
   CritterAttitude,
   CritterWarmTrigger,
   EntityRolePreset,
   LevelEntity,
   MisfitAbilityId,
+  MonsterAttackType,
   ObjectInteractionAttributeId,
   ObjectInteractionCalibration,
 } from '../../types/maker';
@@ -470,7 +485,7 @@ export const EntityAttributeModal: React.FC<{ store: MakerStore }> = ({ store })
                     <input
                       type="range"
                       min={1}
-                      max={15}
+                      max={40}
                       value={entity.health}
                       onChange={(e) =>
                         store.updateEntity(entity.id, 'change health', (ent) => ({
@@ -501,6 +516,273 @@ export const EntityAttributeModal: React.FC<{ store: MakerStore }> = ({ store })
                     />
                   </label>
                 </div>
+
+                {entity.kind === 'baddie' && (() => {
+                  const ai = resolveBaddieAIConfig(entity);
+                  const canFly = Boolean(entity.monsterConfig?.canFly || entity.brain === 'Flyer');
+                  const patchAI = (partial: Partial<BaddieAIConfig>, label: string) => {
+                    store.updateEntity(entity.id, label, (ent) => {
+                      const nextAI = { ...resolveBaddieAIConfig(ent), ...partial };
+                      return {
+                        ...ent,
+                        baddieAI: nextAI,
+                        monsterConfig: ent.monsterConfig
+                          ? {
+                              ...ent.monsterConfig,
+                              primaryAttack: nextAI.primaryAction,
+                              secondaryAttack: nextAI.secondaryAction,
+                              baddieAI: nextAI,
+                            }
+                          : ent.monsterConfig,
+                      };
+                    });
+                  };
+                  const primMeta = BADDIE_ACTION_BY_ID[ai.primaryAction];
+                  const secMeta = BADDIE_ACTION_BY_ID[ai.secondaryAction];
+                  return (
+                    <div className="pt-2.5 mt-1 border-t border-slate-200/80 dark:border-white/[0.08] space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-600 dark:text-[#A5AEC4]">
+                          AI Intelligence, Territory &amp; Action Library
+                        </span>
+                        <span className="text-[10px] font-bold text-[#7C5CFF]">
+                          {canFly ? 'Air + Ground' : 'Ground'}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <label className="space-y-1">
+                          <span className="text-[11px] font-semibold text-slate-500 dark:text-[#949BB0]">
+                            Primary Attack
+                          </span>
+                          <select
+                            value={ai.primaryAction}
+                            onChange={(e) =>
+                              patchAI({ primaryAction: e.target.value as MonsterAttackType }, 'set primary action')
+                            }
+                            className="w-full px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#171A23] text-xs font-semibold"
+                          >
+                            {BADDIE_ACTION_LIBRARY.map((a) => (
+                              <option key={a.id} value={a.id}>
+                                {a.label} ({a.heroEffect})
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] font-semibold text-slate-500 dark:text-[#949BB0]">
+                            Secondary Attack
+                          </span>
+                          <select
+                            value={ai.secondaryAction}
+                            onChange={(e) =>
+                              patchAI({ secondaryAction: e.target.value as MonsterAttackType }, 'set secondary action')
+                            }
+                            className="w-full px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#171A23] text-xs font-semibold"
+                          >
+                            {BADDIE_ACTION_LIBRARY.map((a) => (
+                              <option key={a.id} value={a.id}>
+                                {a.label} ({a.heroEffect})
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                      <p className="text-[10px] text-slate-500 dark:text-[#949BB0] leading-snug">
+                        {primMeta.label} ({primMeta.flightMode === 'groundOnly' ? 'Ground only' : 'Air/Ground'}) · {secMeta.label} ({secMeta.flightMode === 'groundOnly' ? 'Lands to smash' : 'Air/Ground'})
+                      </p>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <label className="space-y-1">
+                          <span className="text-[11px] font-semibold text-slate-500 dark:text-[#949BB0]">
+                            Detection Mode
+                          </span>
+                          <select
+                            value={ai.detectionMode}
+                            onChange={(e) =>
+                              patchAI({ detectionMode: e.target.value as BaddieDetectionMode }, 'set detection mode')
+                            }
+                            className="w-full px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#171A23] text-xs font-semibold"
+                          >
+                            {DETECTION_MODE_OPTIONS.map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[11px] font-semibold text-slate-500 dark:text-[#949BB0]">
+                            {canFly ? 'Flight Pattern' : 'Patrol Pattern'}
+                          </span>
+                          <select
+                            value={canFly ? ai.flightPattern : ai.patrolPattern}
+                            onChange={(e) =>
+                              canFly
+                                ? patchAI({ flightPattern: e.target.value as BaddieFlightPattern }, 'set flight pattern')
+                                : patchAI({ patrolPattern: e.target.value as BaddiePatrolPattern }, 'set patrol pattern')
+                            }
+                            className="w-full px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#171A23] text-xs font-semibold"
+                          >
+                            {(canFly ? FLIGHT_PATTERN_OPTIONS : PATROL_PATTERN_OPTIONS).map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="space-y-1">
+                          <div className="flex justify-between text-[11px] font-semibold">
+                            <span>Aggro Range</span>
+                            <span className="tabular-nums">{ai.aggroRange}m</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={6}
+                            max={45}
+                            step={1}
+                            value={ai.aggroRange}
+                            onChange={(e) => patchAI({ aggroRange: Number(e.target.value) }, 'set aggro range')}
+                            className="w-full accent-[#7C5CFF]"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <div className="flex justify-between text-[11px] font-semibold">
+                            <span>Territory Radius</span>
+                            <span className="tabular-nums">{ai.territoryRadius}m</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={6}
+                            max={50}
+                            step={1}
+                            value={ai.territoryRadius}
+                            onChange={(e) => patchAI({ territoryRadius: Number(e.target.value) }, 'set territory radius')}
+                            className="w-full accent-[#20B46A]"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <div className="flex justify-between text-[11px] font-semibold">
+                            <span>Random Variety</span>
+                            <span className="tabular-nums">{Math.round(ai.varietyFactor * 100)}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={1}
+                            step={0.05}
+                            value={ai.varietyFactor}
+                            onChange={(e) => patchAI({ varietyFactor: Number(e.target.value) }, 'set variety factor')}
+                            className="w-full accent-[#F59E0B]"
+                          />
+                        </label>
+                        {canFly ? (
+                          <label className="space-y-1">
+                            <div className="flex justify-between text-[11px] font-semibold">
+                              <span>Flight Altitude</span>
+                              <span className="tabular-nums">{ai.flightAltitude.toFixed(1)}m</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={1.2}
+                              max={9}
+                              step={0.2}
+                              value={ai.flightAltitude}
+                              onChange={(e) => patchAI({ flightAltitude: Number(e.target.value) }, 'set flight altitude')}
+                              className="w-full accent-[#38BDF8]"
+                            />
+                          </label>
+                        ) : (
+                          <label className="space-y-1">
+                            <div className="flex justify-between text-[11px] font-semibold">
+                              <span>Sight Cone</span>
+                              <span className="tabular-nums">{ai.sightAngleDeg}&deg;</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={45}
+                              max={180}
+                              step={5}
+                              value={ai.sightAngleDeg}
+                              onChange={(e) => patchAI({ sightAngleDeg: Number(e.target.value) }, 'set sight cone')}
+                              className="w-full accent-[#38BDF8]"
+                            />
+                          </label>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <label className="space-y-1">
+                          <span className="text-[11px] font-semibold text-slate-500 dark:text-[#949BB0]">
+                            Pre-Attack Windup Clue
+                          </span>
+                          <select
+                            value={ai.windupClueStyle ?? 'auto'}
+                            onChange={(e) =>
+                              patchAI(
+                                { windupClueStyle: e.target.value as BaddieWindupClueStyle },
+                                'set windup clue style'
+                              )
+                            }
+                            className="w-full px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#171A23] text-xs font-semibold"
+                          >
+                            {WINDUP_CLUE_OPTIONS.map((o) => (
+                              <option key={o.id} value={o.id}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        {canFly && (
+                          <label className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-white dark:bg-[#171A23] border border-sky-500/30 text-xs font-bold cursor-pointer self-end">
+                            <div className="min-w-0">
+                              <div className="text-[11px] font-bold text-slate-800 dark:text-white leading-tight">
+                                Land Between Air Attacks
+                              </div>
+                              <div className="text-[10px] font-normal text-slate-500 dark:text-[#949BB0] truncate">
+                                Hover &amp; land after 1 aerial strike
+                              </div>
+                            </div>
+                            <input
+                              type="checkbox"
+                              checked={ai.landAfterAirAttack !== false}
+                              onChange={(e) =>
+                                patchAI(
+                                  { landAfterAirAttack: e.target.checked },
+                                  'toggle land after air attack'
+                                )
+                              }
+                              className="accent-[#38BDF8] w-4 h-4 shrink-0"
+                            />
+                          </label>
+                        )}
+                      </div>
+
+                      {entity.isBoss && (
+                        <label className="block space-y-1">
+                          <div className="flex justify-between text-[11px] font-semibold">
+                            <span>Victory Treasure Chest Gold</span>
+                            <span className="tabular-nums">{ai.bossRewardCoins ?? 25} Coins</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={5}
+                            max={100}
+                            step={5}
+                            value={ai.bossRewardCoins ?? 25}
+                            onChange={(e) =>
+                              patchAI({ bossRewardCoins: Number(e.target.value) }, 'set boss reward coins')
+                            }
+                            className="w-full accent-[#FBBF24]"
+                          />
+                        </label>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             )}
 

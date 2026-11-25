@@ -15,6 +15,7 @@ import {
   Gauge,
   Map as MapIcon,
   MessageCircle,
+  PackageOpen,
   PanelBottom,
   Pause,
   Play,
@@ -52,9 +53,25 @@ import {
   getRelicById,
   rollRelicDraftOptions,
 } from '../../data/roguelikeEngine';
+import {
+  BADDIE_ACTION_BY_ID,
+  pickNextBaddieAction,
+  resolveBaddieActionId,
+  resolveBaddieAIConfig,
+  type BaddieActionDef,
+} from '../../data/baddieActionLibrary';
+import {
+  computeHeroIncomingDamage,
+  computeHeroOutgoingDamage,
+  evaluateHeroEnvironmentModifiers,
+  resolveHeroProfile,
+  type EnemyTargetDescriptors,
+  type HeroEnvEvalResult,
+} from '../../data/heroTraits';
 import { publishLivePlayerTelemetry, type MakerStore } from '../../store/useMakerStore';
 import type {
   ActionButtonBinding,
+  BaddieAIConfig,
   BehaviorCard,
   BoardPoint,
   BuildingBlockConfig,
@@ -76,12 +93,15 @@ import type {
   EntityKind,
   GameInventoryConfig,
   HeroEquipment,
+  HeroStatusEffectKind,
   HUDState,
   InventoryItemDef,
   InventoryStack,
+  LevelEntity,
   MisfitAbilityId,
   MonsterAbilityId,
   MonsterAttackType,
+  MonsterBlueprint,
   ObjectInteractionAttributeId,
   ObjectInteractionCalibration,
   ObjectMechanism,
@@ -104,6 +124,8 @@ import {
   PlatformMotion,
   resolveHorizontalCollision,
   sampleLevelHeight,
+  sampleTerrainLayer,
+  sampleTerrainWeathering,
   terrainHasMainMountainCave,
   type CollisionFilterContext,
 } from '../../utils/terrain';
@@ -173,6 +195,8 @@ import {
 } from '../../three/webglUtils';
 import {
   MechanismRuntimeController,
+  updateTreasureChestRig,
+  type TreasureChestAnimRig,
 } from '../../three/mechanismController';
 import {
   buildDucklingCompanionMesh,
@@ -197,8 +221,11 @@ import {
 } from '../../three/quadrupedMonsterBuilder';
 import {
   MonsterAttackVfxController,
-  MONSTER_ATTACK_BY_ID,
 } from '../../three/monsterAttackVfx';
+import {
+  HeroCombatEffectsController,
+  type ActiveHeroEffectTimers,
+} from '../../three/heroCombatEffects';
 import {
   attachEquipmentToCustomModel,
   syncHeroEquipmentVisuals,
@@ -226,6 +253,7 @@ import { MakerIcon } from '../shared/IconMap';
 import { InventoryItemIcon } from '../shared/InventoryItemIcon';
 import { IconBadge, Pill } from '../shared/MakerUI';
 import { computeWidgetPosition } from '../stages/InterfaceStage';
+import { ChestLootModal, type ChestLootEntry } from './ChestLootModal';
 import { InventoryModal } from './InventoryModal';
 import { InGameWorldMapModal } from './InGameWorldMapModal';
 import {
@@ -234,7 +262,15 @@ import {
   StorybookEpilogueModal,
 } from './StorybookFrameOverlay';
 
-type BaddieAIState = 'patrol' | 'chase' | 'windup' | 'strike' | 'recover' | 'stagger' | 'dying';
+type BaddieAIState =
+  | 'patrol'
+  | 'chase'
+  | 'landing'
+  | 'windup'
+  | 'strike'
+  | 'recover'
+  | 'stagger'
+  | 'dying';
 
 interface ActiveCharacterSpeech {
   key: string; // 'hero' or entity.id
@@ -318,119 +354,354 @@ function animateCreatureRig(
 
 interface EnemyHealthBar {
   group: THREE.Group;
-  fillPivot: THREE.Group;
-  trailPivot: THREE.Group;
-  frameMat: THREE.MeshBasicMaterial;
-  trackMat: THREE.MeshBasicMaterial;
-  trailMat: THREE.MeshBasicMaterial;
-  fillMat: THREE.MeshBasicMaterial;
-  tickMats: THREE.MeshBasicMaterial[];
+  mesh: THREE.Mesh;
+  mat: THREE.MeshBasicMaterial;
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D | null;
+  tex: THREE.CanvasTexture;
+  fillHex: string;
+  borderHex: string;
+  lastRenderedHp: number;
+  lastFillKey: number;
+  lastTrailKey: number;
+  lastColorKey: string;
+  maxHealth: number;
   displayTrail: number;
   opacity: number;
   heightOffset: number;
 }
 
+function hexLuminance(hex: string): number {
+  const clean = hex.replace('#', '');
+  if (clean.length !== 6) return 0.5;
+  const r = parseInt(clean.slice(0, 2), 16) / 255;
+  const g = parseInt(clean.slice(2, 4), 16) / 255;
+  const b = parseInt(clean.slice(4, 6), 16) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function resolveBaddieHealthBarColors(
+  bp: MonsterBlueprint | undefined,
+  isBoss: boolean,
+  styleTint?: string
+): { fillHex: string; borderHex: string } {
+  let fillCandidate = bp?.bodyColor || styleTint || (isBoss ? '#F59E0B' : '#F2545B');
+  if (!/^#[0-9a-fA-F]{6}$/.test(fillCandidate) || hexLuminance(fillCandidate) < 0.09) {
+    fillCandidate = isBoss ? '#EF4444' : '#F2545B';
+  }
+  const accentCandidates = [bp?.bellyColor, bp?.wingColor, bp?.accentColor, bp?.eyeColor].filter(
+    (c): c is string => Boolean(c && /^#[0-9a-fA-F]{6}$/.test(c))
+  );
+  // Pick a key palette accent with strong visibility for the border + matching numeric HP text
+  let borderHex = isBoss ? '#FBBF24' : '#FCA5A5';
+  if (bp?.accentColor && /^#[0-9a-fA-F]{6}$/.test(bp.accentColor) && hexLuminance(bp.accentColor) > 0.22) {
+    borderHex = bp.accentColor;
+  } else {
+    const brightMatch = accentCandidates.find((c) => hexLuminance(c) > 0.28);
+    if (brightMatch) borderHex = brightMatch;
+  }
+  return { fillHex: fillCandidate, borderHex };
+}
+
+function drawRoundedRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number
+) {
+  const radius = Math.min(r, w * 0.5, h * 0.5);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + w - radius, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+  ctx.lineTo(x + w, y + h - radius);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+  ctx.lineTo(x + radius, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+}
+
+function redrawEnemyHealthBar(
+  bar: EnemyHealthBar,
+  curHp: number,
+  maxHp: number,
+  trailRatioOverride?: number
+) {
+  const safeMax = Math.max(1, maxHp);
+  const clampedCur = Math.max(0, Math.ceil(curHp));
+  const hpRatio = THREE.MathUtils.clamp(curHp / safeMax, 0, 1);
+  const trailRatio = THREE.MathUtils.clamp(
+    trailRatioOverride ?? bar.displayTrail ?? hpRatio,
+    hpRatio,
+    1
+  );
+  const fillKey = Math.round(hpRatio * 400);
+  const trailKey = Math.round(trailRatio * 400);
+  const colorKey = `${bar.fillHex}|${bar.borderHex}`;
+
+  if (
+    bar.lastRenderedHp === clampedCur &&
+    bar.maxHealth === safeMax &&
+    bar.lastFillKey === fillKey &&
+    bar.lastTrailKey === trailKey &&
+    bar.lastColorKey === colorKey
+  ) {
+    return;
+  }
+  bar.lastRenderedHp = clampedCur;
+  bar.maxHealth = safeMax;
+  bar.lastFillKey = fillKey;
+  bar.lastTrailKey = trailKey;
+  bar.lastColorKey = colorKey;
+
+  const ctx = bar.ctx;
+  if (!ctx) return;
+  const { width, height } = bar.canvas;
+  ctx.clearRect(0, 0, width, height);
+
+  // 1. Numeric HP readout above the bar matching the border color
+  const label = `${clampedCur} / ${safeMax}`;
+  ctx.font = '900 32px system-ui, -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = 'rgba(10, 12, 18, 0.96)';
+  ctx.strokeText(label, width / 2, 24);
+  ctx.fillStyle = bar.borderHex || '#FBBF24';
+  ctx.fillText(label, width / 2, 24);
+
+  // 2. Outer border frame matching baddie key accent color
+  const outerX = 12;
+  const outerY = 50;
+  const outerW = width - 24;
+  const outerH = 48;
+  const pad = 6;
+  drawRoundedRectPath(ctx, outerX, outerY, outerW, outerH, 12);
+  ctx.fillStyle = bar.borderHex || '#FBBF24';
+  ctx.fill();
+
+  // 3. Dark empty background track
+  const trackX = outerX + pad;
+  const trackY = outerY + pad;
+  const trackW = outerW - pad * 2;
+  const trackH = outerH - pad * 2;
+  drawRoundedRectPath(ctx, trackX, trackY, trackW, trackH, 7);
+  ctx.fillStyle = '#131722';
+  ctx.fill();
+
+  // Clip inner track for trail + fill + gloss + segment ticks
+  ctx.save();
+  drawRoundedRectPath(ctx, trackX, trackY, trackW, trackH, 7);
+  ctx.clip();
+
+  // 4. Delayed damage-chunk trail bar
+  const trailW = trackW * trailRatio;
+  if (trailW > 1.5 && trailRatio > hpRatio + 0.002) {
+    ctx.fillStyle = '#FEF08A';
+    ctx.fillRect(trackX, trackY, trailW, trackH);
+  }
+
+  // 5. Primary solid colored HP fill (depletes left-to-right on attacks)
+  const fillW = trackW * hpRatio;
+  if (fillW > 1.5) {
+    const safeFill =
+      bar.fillHex && hexLuminance(bar.fillHex) >= 0.08 ? bar.fillHex : '#EF4444';
+    ctx.fillStyle = safeFill;
+    ctx.fillRect(trackX, trackY, fillW, trackH);
+
+    // Subtle top specular highlight so the bar feels crisp and dimensional
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.26)';
+    ctx.fillRect(trackX, trackY, fillW, Math.max(4, Math.round(trackH * 0.34)));
+
+    // Subtle bottom shade
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
+    ctx.fillRect(trackX, trackY + Math.round(trackH * 0.72), fillW, Math.round(trackH * 0.28));
+  }
+
+  // 6. Segment divider ticks for readable HP chunks
+  if (safeMax > 1 && safeMax <= 12) {
+    ctx.fillStyle = 'rgba(13, 16, 26, 0.65)';
+    for (let i = 1; i < safeMax; i++) {
+      const tx = Math.round(trackX + (trackW * i) / safeMax);
+      ctx.fillRect(tx - 1, trackY, 3, trackH);
+    }
+  }
+  ctx.restore();
+
+  bar.tex.needsUpdate = true;
+}
+
 function createEnemyHealthBar(
   maxHealth: number,
   isBoss: boolean,
-  heightOffset: number
+  heightOffset: number,
+  fillHex = isBoss ? '#F59E0B' : '#F2545B',
+  borderHex = isBoss ? '#FBBF24' : '#FCA5A5'
 ): EnemyHealthBar {
-  const w = isBoss ? 1.56 : 1.08;
-  const h = isBoss ? 0.18 : 0.13;
-  const pad = isBoss ? 0.045 : 0.036;
+  const planeW = isBoss ? 1.92 : 1.32;
+  const planeH = isBoss ? 0.56 : 0.39;
 
   const group = new THREE.Group();
   group.visible = false;
-  group.renderOrder = 20;
+  group.renderOrder = 25;
 
-  const frameMat = new THREE.MeshBasicMaterial({
-    color: '#12151E',
+  const canvas = document.createElement('canvas');
+  canvas.width = 384;
+  canvas.height = 112;
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+
+  const mat = new THREE.MeshBasicMaterial({
+    map: tex,
     transparent: true,
     opacity: 0,
     depthWrite: false,
     toneMapped: false,
+    side: THREE.DoubleSide,
   });
-  const frame = new THREE.Mesh(new THREE.PlaneGeometry(w + pad * 2, h + pad * 2), frameMat);
-  frame.renderOrder = 20;
-  group.add(frame);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(planeW, planeH), mat);
+  mesh.renderOrder = 25;
+  group.add(mesh);
 
-  const trackMat = new THREE.MeshBasicMaterial({
-    color: '#2A2F3D',
-    transparent: true,
-    opacity: 0,
-    depthWrite: false,
-    toneMapped: false,
-  });
-  const track = new THREE.Mesh(new THREE.PlaneGeometry(w, h), trackMat);
-  track.position.z = 0.004;
-  track.renderOrder = 21;
-  group.add(track);
-
-  // Delayed damage-chunk trail bar (anchored left)
-  const trailPivot = new THREE.Group();
-  trailPivot.position.set(-w / 2, 0, 0.008);
-  const trailMat = new THREE.MeshBasicMaterial({
-    color: '#FFE6A8',
-    transparent: true,
-    opacity: 0,
-    depthWrite: false,
-    toneMapped: false,
-  });
-  const trailMesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), trailMat);
-  trailMesh.position.x = w / 2;
-  trailMesh.renderOrder = 22;
-  trailPivot.add(trailMesh);
-  group.add(trailPivot);
-
-  // Primary HP fill bar (anchored left)
-  const fillPivot = new THREE.Group();
-  fillPivot.position.set(-w / 2, 0, 0.012);
-  const fillMat = new THREE.MeshBasicMaterial({
-    color: isBoss ? '#F59E0B' : '#F2545B',
-    transparent: true,
-    opacity: 0,
-    depthWrite: false,
-    toneMapped: false,
-  });
-  const fillMesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), fillMat);
-  fillMesh.position.x = w / 2;
-  fillMesh.renderOrder = 23;
-  fillPivot.add(fillMesh);
-  group.add(fillPivot);
-
-  // Discrete segment ticks when HP is small enough to read at a glance
-  const tickMats: THREE.MeshBasicMaterial[] = [];
-  if (maxHealth > 1 && maxHealth <= 10) {
-    const tickGeo = new THREE.PlaneGeometry(0.022, h);
-    for (let i = 1; i < maxHealth; i++) {
-      const tickMat = new THREE.MeshBasicMaterial({
-        color: '#12151E',
-        transparent: true,
-        opacity: 0,
-        depthWrite: false,
-        toneMapped: false,
-      });
-      const tick = new THREE.Mesh(tickGeo, tickMat);
-      tick.position.set(-w / 2 + (w * i) / maxHealth, 0, 0.016);
-      tick.renderOrder = 24;
-      group.add(tick);
-      tickMats.push(tickMat);
-    }
-  }
-
-  return {
+  const bar: EnemyHealthBar = {
     group,
-    fillPivot,
-    trailPivot,
-    frameMat,
-    trackMat,
-    trailMat,
-    fillMat,
-    tickMats,
+    mesh,
+    mat,
+    canvas,
+    ctx,
+    tex,
+    fillHex,
+    borderHex,
+    lastRenderedHp: -1,
+    lastFillKey: -1,
+    lastTrailKey: -1,
+    lastColorKey: '',
+    maxHealth,
     displayTrail: 1,
     opacity: 0,
     heightOffset,
   };
+  redrawEnemyHealthBar(bar, maxHealth, maxHealth, 1);
+  return bar;
+}
+
+function buildChestLootEntriesForEntity(
+  ent: {
+    id: string;
+    name: string;
+    loot?: string;
+    pickupItemId?: string;
+    pickupQty?: number;
+    cards?: BehaviorCard[];
+  },
+  mechs: ObjectMechanism[],
+  itemById: Map<string, InventoryItemDef>,
+  itemCatalog: InventoryItemDef[],
+  isRoguelike: boolean
+): ChestLootEntry[] {
+  const entries: ChestLootEntry[] = [];
+  const addedItemIds = new Set<string>();
+  const lowerName = ent.name.toLowerCase();
+
+  // 1. Determine coin hoard from mechanism rewards, giveTreasure cards, or chest tier
+  let coinCount = 0;
+  for (const mech of mechs) {
+    for (const trig of mech.triggers) {
+      if (trig.rewardCoins && trig.rewardCoins > 0) {
+        coinCount = Math.max(coinCount, trig.rewardCoins);
+      }
+    }
+  }
+  for (const card of ent.cards ?? []) {
+    for (const act of card.actions ?? []) {
+      if (act.key === 'giveTreasure' && act.detail) {
+        const m = act.detail.match(/(\d+)/);
+        if (m) coinCount = Math.max(coinCount, Number(m[1]));
+      }
+    }
+  }
+  if (coinCount <= 0) {
+    coinCount = lowerName.includes('vault') || lowerName.includes('boss')
+      ? 10 + Math.floor(Math.random() * 6)
+      : 4 + Math.floor(Math.random() * 5);
+  }
+
+  // 2. Include explicitly configured pickup item or mechanism reward item
+  const addItemEntry = (itemId: string, qty = 1, subtitle = 'Chest Treasure') => {
+    const def = itemById.get(itemId);
+    if (!def) return;
+    const meta = resolveItemMetadata(def);
+    addedItemIds.add(itemId);
+    entries.push({
+      uid: `${ent.id}_item_${itemId}_${entries.length}`,
+      kind: 'item',
+      qty: Math.max(1, qty),
+      label: def.name,
+      subtitle,
+      rarity: meta.rarity,
+      itemId: def.id,
+      itemDef: def,
+    });
+  };
+
+  if (ent.pickupItemId) {
+    addItemEntry(ent.pickupItemId, ent.pickupQty ?? 1, 'Featured Treasure');
+  }
+  for (const mech of mechs) {
+    for (const trig of mech.triggers) {
+      if (trig.rewardItemId && !addedItemIds.has(trig.rewardItemId)) {
+        addItemEntry(trig.rewardItemId, 1, 'Vault Reward');
+      }
+    }
+  }
+  if (lowerName.includes('crown') && !addedItemIds.has('golden_crown')) {
+    addItemEntry('golden_crown', 1, 'Royal Relic');
+  }
+  if (ent.loot?.toLowerCase().includes('health') && !addedItemIds.has('healing_tonic')) {
+    addItemEntry('healing_tonic', 1, 'Restorative Brew');
+  }
+
+  // 3. Roll 1–2 dynamic extra items so chests have varied ever-changing contents to browse
+  const pool = itemCatalog.filter(
+    (item) =>
+      item.id !== 'parachute_blanket' &&
+      item.id !== 'iron_sword' &&
+      !addedItemIds.has(item.id)
+  );
+  const targetExtraItems = entries.length === 0 ? 2 : isRoguelike || Math.random() < 0.75 ? 1 : 0;
+  if (pool.length > 0 && targetExtraItems > 0) {
+    const shuffled = [...pool].sort(() => Math.random() - 0.5);
+    for (let i = 0; i < Math.min(targetExtraItems, shuffled.length); i++) {
+      const pick = shuffled[i];
+      const qty =
+        pick.category === 'consumable' || pick.category === 'resource'
+          ? 1 + (Math.random() < 0.35 ? 1 : 0)
+          : 1;
+      addItemEntry(pick.id, qty, 'Hidden Treasure');
+    }
+  }
+
+  // 4. Add Gold Coins entry
+  if (coinCount > 0) {
+    entries.push({
+      uid: `${ent.id}_coins`,
+      kind: 'coin',
+      qty: coinCount,
+      label: 'Gold Coins',
+      subtitle: 'Gleaming Treasure',
+      rarity: coinCount >= 12 ? 'rare' : coinCount >= 6 ? 'uncommon' : 'common',
+    });
+  }
+
+  return entries;
 }
 
 interface RuntimeEntity {
@@ -496,6 +767,10 @@ interface RuntimeEntity {
   mechController: MechanismRuntimeController | null;
   mechNearState: Record<string, boolean>;
   mechFlagFired: Record<string, boolean>;
+  chestAnim: TreasureChestAnimRig | null;
+  chestLootEntries: ChestLootEntry[];
+  chestOpening: boolean;
+  chestOpenTimer: number;
   fxRuntime: FxEmitterRuntime | null;
   isBuddy: boolean;
   buddyAreaLabel?: string;
@@ -532,6 +807,25 @@ interface RuntimeEntity {
   entityScale?: number;
   npcWanderAngle?: number;
   npcWanderTimer?: number;
+  baddieAI?: BaddieAIConfig;
+  flightY: number;
+  targetFlightY: number;
+  patrolAngle: number;
+  lockedTargetX: number;
+  lockedTargetZ: number;
+  varietyCooldownMult: number;
+  behaviorChaseOrdered: boolean;
+  behaviorFleeOrdered: boolean;
+  behaviorAttackQueue: MonsterAttackType | null;
+  enraged: boolean;
+  dyingDuration: number;
+  deathFinalized: boolean;
+  keyFillColor: string;
+  keyBorderColor: string;
+  airAttacksSinceLand: number;
+  postAirHoverTimer: number;
+  groundedHoldTimer: number;
+  mustLandBeforeAttack: boolean;
 }
 
 export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
@@ -577,6 +871,19 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     isOpen: boolean;
     locked: boolean;
   } | null>(null);
+  const [chestInteractPrompt, setChestInteractPrompt] = useState<{
+    label: string;
+    isOpen: boolean;
+    locked: boolean;
+    lockedMessage?: string;
+    itemCount: number;
+  } | null>(null);
+  const [isChestOpeningAnim, setIsChestOpeningAnim] = useState(false);
+  const [activeChestLoot, setActiveChestLoot] = useState<{
+    entityId: string;
+    chestName: string;
+    entries: ChestLootEntry[];
+  } | null>(null);
   const [sitPrompt, setSitPrompt] = useState<{
     label: string;
     isSitting: boolean;
@@ -589,10 +896,25 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
   const [fishingBanner, setFishingBanner] = useState<'none' | 'waiting' | 'bite'>('none');
   const [inventoryStacks, setInventoryStacks] = useState<InventoryStack[]>([
     { itemId: 'iron_sword', qty: 1, durability: 100, maxDurability: 100 },
+    { itemId: 'oak_shield', qty: 1, durability: 120, maxDurability: 120 },
+    { itemId: 'wood_axe', qty: 1, durability: 90, maxDurability: 90 },
     { itemId: 'parachute_blanket', qty: 1, durability: 100, maxDurability: 100 },
   ]);
+  const [heroStatusBanner, setHeroStatusBanner] = useState<{
+    label: string;
+    kind: HeroStatusEffectKind | 'knockdown';
+  } | null>(null);
+  const [heroTraitBanner, setHeroTraitBanner] = useState<{
+    label: string;
+    tone: 'strength' | 'flaw';
+  } | null>(null);
+  const [bossVictoryBanner, setBossVictoryBanner] = useState<{
+    bossName: string;
+    coins: number;
+  } | null>(null);
   const [equipment, setEquipment] = useState<HeroEquipment>({
     heldItemId: 'iron_sword',
+    offhandItemId: 'oak_shield',
     headItemId: null,
     bodyItemId: null,
     accessoryItemId: null,
@@ -658,6 +980,12 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
   fastTravelStateRef.current = fastTravelState;
   const showTitleRef = useRef(showTitle);
   showTitleRef.current = showTitle;
+  const activeChestLootRef = useRef(activeChestLoot);
+  activeChestLootRef.current = activeChestLoot;
+  const chestEntriesByEntityRef = useRef<Map<string, ChestLootEntry[]>>(new Map());
+  const openChestModalFnRef = useRef<(entityId: string, chestName: string) => void>(() => {});
+  const liveGrantCurrencyRef = useRef<(coinDelta: number, keyDelta: number) => void>(() => {});
+  const chestOpeningLockRef = useRef(false);
 
   openFastTravelRef.current = (plinthEntityId: string, plinthName: string) => {
     if (!currentProject) return;
@@ -1033,7 +1361,8 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       !activeBottomSpeech.isProximity &&
       activeBottomSpeech.outputMode !== 'audio') ||
       worldMapOpen ||
-      fastTravelState !== null
+      fastTravelState !== null ||
+      activeChestLoot !== null
   );
 
   const showToastGlobal = useCallback((msg: string) => {
@@ -1070,6 +1399,105 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     []
   );
 
+  openChestModalFnRef.current = (entityId: string, chestName: string) => {
+    const entries = chestEntriesByEntityRef.current.get(entityId) ?? [];
+    if (entries.length === 0) {
+      showToastGlobal(`${chestName} is empty.`);
+      return;
+    }
+    inputRef.current.keys.clear();
+    inputRef.current.interactQueued = false;
+    inputRef.current.interactPointerDown = false;
+    setActiveChestLoot({
+      entityId,
+      chestName,
+      entries: [...entries],
+    });
+  };
+
+  const grantChestEntryToHero = useCallback(
+    (entry: ChestLootEntry, silentToast = false) => {
+      if (entry.kind === 'coin') {
+        liveGrantCurrencyRef.current(entry.qty, 0);
+        setHudState((prev) => ({ ...prev, coins: prev.coins + entry.qty }));
+        if (!silentToast) {
+          showToastGlobal(`Added +${entry.qty} Gold Coins!`);
+        }
+      } else if (entry.kind === 'key') {
+        liveGrantCurrencyRef.current(0, entry.qty);
+        setHudState((prev) => ({ ...prev, keys: prev.keys + entry.qty }));
+        if (!silentToast) {
+          showToastGlobal(`Added +${entry.qty} Key to inventory!`);
+        }
+      } else if (entry.kind === 'item' && entry.itemId) {
+        addItemToBag(entry.itemId, entry.qty, false);
+        if (!silentToast) {
+          showToastGlobal(
+            `Moved ${entry.qty > 1 ? `${entry.qty}× ` : ''}${entry.label} to inventory!`
+          );
+        }
+      }
+    },
+    [addItemToBag, showToastGlobal]
+  );
+
+  const handleTakeChestEntry = useCallback(
+    (entryUid: string) => {
+      const current = activeChestLootRef.current;
+      if (!current) return;
+      const list = chestEntriesByEntityRef.current.get(current.entityId) ?? current.entries;
+      const target = list.find((e) => e.uid === entryUid);
+      if (!target) return;
+
+      grantChestEntryToHero(target, false);
+      AudioEngine.playSound(currentLevel?.audio?.coin ?? 'coin');
+
+      const nextList = list.filter((e) => e.uid !== entryUid);
+      list.length = 0;
+      list.push(...nextList);
+      chestEntriesByEntityRef.current.set(current.entityId, list);
+
+      if (nextList.length === 0) {
+        setActiveChestLoot(null);
+      } else {
+        setActiveChestLoot({
+          ...current,
+          entries: [...nextList],
+        });
+      }
+    },
+    [currentLevel?.audio?.coin, grantChestEntryToHero]
+  );
+
+  const handleTakeAllChestEntries = useCallback(() => {
+    const current = activeChestLootRef.current;
+    if (!current) return;
+    const list = chestEntriesByEntityRef.current.get(current.entityId) ?? current.entries;
+    if (list.length === 0) {
+      setActiveChestLoot(null);
+      return;
+    }
+
+    let coinTotal = 0;
+    const itemLabels: string[] = [];
+    for (const entry of list) {
+      grantChestEntryToHero(entry, true);
+      if (entry.kind === 'coin') coinTotal += entry.qty;
+      else itemLabels.push(`${entry.qty > 1 ? `${entry.qty}× ` : ''}${entry.label}`);
+    }
+
+    list.length = 0;
+    chestEntriesByEntityRef.current.set(current.entityId, list);
+    AudioEngine.playSound(currentLevel?.audio?.coin ?? 'coin');
+    AudioEngine.playSound('chime');
+
+    const parts: string[] = [];
+    if (coinTotal > 0) parts.push(`+${coinTotal} Coins`);
+    if (itemLabels.length > 0) parts.push(itemLabels.join(', '));
+    showToastGlobal(`Looted ${current.chestName}: ${parts.join(' · ')}!`);
+    setActiveChestLoot(null);
+  }, [currentLevel?.audio?.coin, grantChestEntryToHero, showToastGlobal]);
+
   const removeItemFromBag = useCallback((itemId: string, qty = 1) => {
     setInventoryStacks((prev) => {
       const next = prev
@@ -1079,6 +1507,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       if (!stillHas) {
         setEquipment((eq) => ({
           heldItemId: eq.heldItemId === itemId ? null : eq.heldItemId,
+          offhandItemId: eq.offhandItemId === itemId ? null : eq.offhandItemId,
           headItemId: eq.headItemId === itemId ? null : eq.headItemId,
           bodyItemId: eq.bodyItemId === itemId ? null : eq.bodyItemId,
           accessoryItemId: eq.accessoryItemId === itemId ? null : eq.accessoryItemId,
@@ -1108,21 +1537,27 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           ? { headItemId: item.id }
           : item.wearSlot === 'body'
           ? { bodyItemId: item.id }
+          : item.wearSlot === 'offhand'
+          ? { offhandItemId: item.id }
           : { accessoryItemId: item.id }),
       }));
       AudioEngine.playSound('chime');
-      showToastGlobal(`Wearing ${item.name}!`);
+      showToastGlobal(
+        item.wearSlot === 'offhand' ? `Armed ${item.name} in off-hand!` : `Wearing ${item.name}!`
+      );
     },
     [showToastGlobal]
   );
 
-  const handleUnequipSlot = useCallback((slot: 'head' | 'body' | 'accessory') => {
+  const handleUnequipSlot = useCallback((slot: 'head' | 'body' | 'accessory' | 'offhand') => {
     setEquipment((prev) => ({
       ...prev,
       ...(slot === 'head'
         ? { headItemId: null }
         : slot === 'body'
         ? { bodyItemId: null }
+        : slot === 'offhand'
+        ? { offhandItemId: null }
         : { accessoryItemId: null }),
     }));
   }, []);
@@ -1213,6 +1648,32 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     [showToastGlobal, store]
   );
 
+  const wearShieldDurability = useCallback(
+    (amount = 2) => {
+      const offId = equipmentRef.current.offhandItemId;
+      if (!offId) return;
+      const def = itemByIdRef.current.get(offId);
+      if (!def) return;
+      const baseMeta = resolveItemMetadata(def);
+      if (baseMeta.maxDurability <= 1) return;
+      store.wearItemDurability(offId, amount);
+      setInventoryStacks((prev) =>
+        prev.map((s) => {
+          if (s.itemId !== offId) return s;
+          const storeDur = store.runtimeDurability[offId];
+          const maxD = storeDur?.maxDurability ?? s.maxDurability ?? baseMeta.maxDurability;
+          const curD = storeDur?.durability ?? s.durability ?? baseMeta.durability;
+          const nextD = Math.max(0, curD - amount);
+          if (curD > Math.floor(maxD * 0.2) && nextD <= Math.floor(maxD * 0.2)) {
+            showToastGlobal(`${def.name} is splintering — repair at a Crafting Bench!`);
+          }
+          return { ...s, durability: nextD, maxDurability: maxD };
+        })
+      );
+    },
+    [showToastGlobal, store]
+  );
+
   const wearHeldDurability = useCallback(
     (amount = 2) => {
       const heldId = equipmentRef.current.heldItemId;
@@ -1255,14 +1716,30 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     };
   }, [store.resetRuntimeDurability]);
 
-  // Derived wearable/held hero bonuses for display in InventoryModal
+  // Derived hero profile + wearable/held bonuses for display in InventoryModal
   const heroBonusStats = useMemo(() => {
+    const profile = resolveHeroProfile(currentProject);
+    const skills = new Set(profile.skills);
     let maxHpBonus = 0;
-    let attackPower = 1;
-    let defensePower = 0;
-    let speedBonus = 0;
+    let attackPower =
+      profile.stats.baseAttack +
+      (skills.has('powerStrike') ? 1 : 0) +
+      (skills.has('glassCannon') ? 2 : 0);
+    let defensePower = Math.max(
+      0,
+      profile.stats.baseDefense +
+        (skills.has('heavyArmorClumsy') ? 1 : 0) -
+        (skills.has('glassCannon') ? 1 : 0)
+    );
+    let speedBonus = profile.stats.moveSpeedMult - 1;
+    const heldDefForStats = equipment.heldItemId ? itemById.get(equipment.heldItemId) : null;
+    const twoHandedForStats =
+      heldDefForStats?.handedness === 'twoHand' ||
+      heldDefForStats?.toolKind === 'axe' ||
+      heldDefForStats?.toolKind === 'fishingPole';
     const activeIds = [
       equipment.heldItemId,
+      ...(twoHandedForStats ? [] : [equipment.offhandItemId ?? null]),
       equipment.headItemId,
       equipment.bodyItemId,
       equipment.accessoryItemId,
@@ -1286,7 +1763,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       defensePower,
       speedPct: Math.round((1 + speedBonus) * 100),
     };
-  }, [equipment, itemById]);
+  }, [currentProject, equipment, itemById]);
 
   const quickHotbarTools = useMemo(() => {
     return inventoryStacks
@@ -1505,6 +1982,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       inventoryOpen ||
       worldMapOpen ||
       fastTravelState !== null ||
+      activeChestLoot !== null ||
       hasRelicDraftOpen,
     finished,
     dead,
@@ -1519,6 +1997,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
         inventoryOpen ||
         worldMapOpen ||
         fastTravelState !== null ||
+        activeChestLoot !== null ||
         hasRelicDraftOpen
     );
     return () => store.setPlayModalOpen(false);
@@ -1530,6 +2009,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     inventoryOpen,
     worldMapOpen,
     fastTravelState,
+    activeChestLoot,
     hasRelicDraftOpen,
     store.setPlayModalOpen,
   ]);
@@ -1723,7 +2203,9 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           handleHoldItem(picked.id);
         }
       } else if (e.code === 'Escape') {
-        if (fastTravelStateRef.current) {
+        if (activeChestLootRef.current) {
+          setActiveChestLoot(null);
+        } else if (fastTravelStateRef.current) {
           setFastTravelState(null);
         } else if (worldMapOpenRef.current) {
           setWorldMapOpen(false);
@@ -1974,6 +2456,8 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
 
     const activeFxRuntimes: FxEmitterRuntime[] = [];
     const monsterVfx = new MonsterAttackVfxController(scene);
+    const heroEffects = new HeroCombatEffectsController(scene);
+    let activeRuntimeEntities: RuntimeEntity[] = [];
     const scentPuffGeo = new THREE.SphereGeometry(0.42, 10, 10);
     const sonarRingGeo = new THREE.RingGeometry(0.75, 1.08, 36);
     sonarRingGeo.rotateX(-Math.PI / 2);
@@ -2621,6 +3105,13 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
         }
 
         const resolvedMonster = ent.monsterConfig ? resolveMonsterBlueprint(ent.monsterConfig) : null;
+        const baddieAI = ent.kind === 'baddie' ? resolveBaddieAIConfig(ent) : undefined;
+        const canFly = Boolean(quadrupedRig?.canFly || baddieRig?.isFlyer);
+        const keyColors = resolveBaddieHealthBarColors(
+          resolvedMonster ?? undefined,
+          ent.isBoss,
+          ent.styleTint
+        );
         const baseHp = Math.max(1, ent.health);
         const maxHp =
           resolvedMonster?.specialAbility === 'thickFat'
@@ -2638,8 +3129,19 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               barHeight = THREE.MathUtils.clamp(modelH + 0.36, 1.85, 3.6);
             }
           }
-          hpBar = createEnemyHealthBar(maxHp, ent.isBoss, barHeight);
-          hpBar.group.position.set(wx, Math.max(-1, wy) + barHeight, wz);
+          hpBar = createEnemyHealthBar(
+            maxHp,
+            ent.isBoss,
+            barHeight,
+            keyColors.fillHex,
+            keyColors.borderHex
+          );
+          redrawEnemyHealthBar(hpBar, maxHp, maxHp, 1);
+          const initFlyY = canFly && baddieAI ? baddieAI.flightAltitude : 0;
+          if (initFlyY > 0) {
+            mesh.position.y += initFlyY;
+          }
+          hpBar.group.position.set(wx, Math.max(-1, wy) + initFlyY + barHeight, wz);
           scene.add(hpBar.group);
         }
 
@@ -2658,6 +3160,21 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           resolvedMechs.length > 0
             ? new MechanismRuntimeController(mechRoot, resolvedMechs)
             : null;
+        const chestAnim =
+          (mesh.userData.chestAnim as TreasureChestAnimRig | undefined) ?? null;
+        const chestLootEntries =
+          ent.kind === 'treasure'
+            ? buildChestLootEntriesForEntity(
+                ent,
+                resolvedMechs,
+                itemByIdRef.current,
+                itemCatalog,
+                isRoguelikeLevel
+              )
+            : [];
+        if (ent.kind === 'treasure') {
+          chestEntriesByEntityRef.current.set(ent.id, chestLootEntries);
+        }
 
         const resolvedChatStyle = resolveChatBubbleStyle(ent.chatBubble, ent.kind);
         const primaryDialogue =
@@ -2732,13 +3249,13 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           recoilRoll: 0,
           walkPhase: Math.random() * Math.PI * 2,
           defeatSpin: 0,
-          monsterPrimaryAttack: resolvedMonster?.primaryAttack,
-          monsterSecondaryAttack: resolvedMonster?.secondaryAttack,
+          monsterPrimaryAttack: baddieAI?.primaryAction ?? resolvedMonster?.primaryAttack,
+          monsterSecondaryAttack: baddieAI?.secondaryAction ?? resolvedMonster?.secondaryAttack,
           monsterAbility: resolvedMonster?.specialAbility,
           monsterAttackPower: resolvedMonster?.attackPower,
           monsterAttackRange: resolvedMonster?.attackRange,
           monsterAttackCooldown: resolvedMonster?.attackCooldown,
-          activeAttack: resolvedMonster?.primaryAttack ?? 'clawSlash',
+          activeAttack: baddieAI?.primaryAction ?? resolvedMonster?.primaryAttack ?? 'clawSlash',
           attackCycleCount: 0,
           regenTimer: 0,
           pickupable: Boolean(ent.pickupable || ent.pickupItemId || ent.kind === 'pickup'),
@@ -2750,6 +3267,10 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           mechController,
           mechNearState: {},
           mechFlagFired: {},
+          chestAnim,
+          chestLootEntries,
+          chestOpening: false,
+          chestOpenTimer: 0,
           fxRuntime,
           isBuddy: Boolean(ent.isBuddy),
           buddyAreaLabel: ent.buddyAreaLabel,
@@ -2793,8 +3314,216 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             ent.interactionCalibrations ?? customMeta?.interactionCalibrations,
           entityYaw: (ent.rotation * Math.PI) / 180,
           entityScale: Math.max(0.25, ent.scale || 1),
+          baddieAI,
+          flightY: canFly && baddieAI ? baddieAI.flightAltitude : 0,
+          targetFlightY: canFly && baddieAI ? baddieAI.flightAltitude : 0,
+          patrolAngle: Math.random() * Math.PI * 2,
+          lockedTargetX: wx,
+          lockedTargetZ: wz,
+          varietyCooldownMult: 1,
+          behaviorChaseOrdered: false,
+          behaviorFleeOrdered: false,
+          behaviorAttackQueue: null,
+          enraged: false,
+          dyingDuration: ent.isBoss ? 1.45 : 0.95,
+          deathFinalized: false,
+          keyFillColor: keyColors.fillHex,
+          keyBorderColor: keyColors.borderHex,
+          airAttacksSinceLand: 0,
+          postAirHoverTimer: 0,
+          groundedHoldTimer: 0,
+          mustLandBeforeAttack: false,
         };
       });
+
+      activeRuntimeEntities = runtimeEntities;
+
+      const spawnBossRewardChest = (bossRt: RuntimeEntity) => {
+        const chestId = `boss_chest_${bossRt.id}_${Math.round(performance.now())}`;
+        const chestName = `${bossRt.name} Great Chest`;
+        const [cx, cz] = resolveHorizontalCollision(
+          activeLevel,
+          bossRt.x,
+          bossRt.z,
+          0.9,
+          false,
+          collisionCtx
+        );
+        const cy = sampleLevelHeight(activeLevel, cx, cz);
+        const tempChestEnt: LevelEntity = {
+          id: chestId,
+          name: chestName,
+          kind: 'treasure',
+          position: levelWorldToBoard(activeLevel, cx, cz),
+          scale: 1.35,
+          rotation: Math.round((Math.atan2(heroX - cx, heroZ - cz) * 180) / Math.PI),
+          speed: 0,
+          health: 1,
+          damage: 0,
+          brain: 'Guardian',
+          isBoss: false,
+          loot: 'treasure',
+          puzzleType: 'none',
+          dialogue: '',
+          platformPreset: 'stoneLift',
+          platformMotion: 'slide',
+          platformSpeed: 0,
+          platformWait: 0,
+          platformRunning: false,
+          conversation: [],
+          notes: '',
+          styleTint: '#FACC15',
+          cards: [],
+        };
+        const chestMesh = buildEntityMesh(tempChestEnt);
+        applyVisualStyleToObject(chestMesh, style);
+        chestMesh.position.set(cx, cy, cz);
+        chestMesh.rotation.y = Math.atan2(heroX - cx, heroZ - cz);
+        scene.add(chestMesh);
+
+        const chestAnim =
+          (chestMesh.userData.chestAnim as TreasureChestAnimRig | undefined) ?? null;
+        const rewardCoins = bossRt.baddieAI?.bossRewardCoins ?? 30;
+        const rewardItemIds = bossRt.baddieAI?.bossRewardItems ?? [
+          'golden_crown',
+          'bone_amulet',
+          'healing_tonic',
+        ];
+        const entries: ChestLootEntry[] = [];
+        for (const itemId of rewardItemIds) {
+          const def = itemByIdRef.current.get(itemId);
+          if (!def) continue;
+          const meta = resolveItemMetadata(def);
+          entries.push({
+            uid: `${chestId}_${itemId}_${entries.length}`,
+            kind: 'item',
+            qty: 1,
+            label: def.name,
+            subtitle: `${bossRt.name} Trophy`,
+            rarity: meta.rarity,
+            itemId: def.id,
+            itemDef: def,
+          });
+        }
+        if (entries.length === 0) {
+          const fallbackPool = itemCatalog.filter(
+            (i) => i.id !== 'iron_sword' && i.id !== 'parachute_blanket'
+          );
+          for (const pick of fallbackPool.slice(0, 2)) {
+            const meta = resolveItemMetadata(pick);
+            entries.push({
+              uid: `${chestId}_${pick.id}_${entries.length}`,
+              kind: 'item',
+              qty: 1,
+              label: pick.name,
+              subtitle: `${bossRt.name} Trophy`,
+              rarity: meta.rarity,
+              itemId: pick.id,
+              itemDef: pick,
+            });
+          }
+        }
+        entries.push({
+          uid: `${chestId}_coins`,
+          kind: 'coin',
+          qty: rewardCoins,
+          label: 'Royal Gold Hoard',
+          subtitle: `${bossRt.name} Bounty`,
+          rarity: 'epic',
+        });
+        chestEntriesByEntityRef.current.set(chestId, entries);
+
+        runtimeEntities.push({
+          id: chestId,
+          kind: 'treasure',
+          name: chestName,
+          mesh: chestMesh,
+          customInst: null,
+          baddieRig: null,
+          quadrupedRig: null,
+          customFlashMats: [],
+          hpBar: null,
+          x: cx,
+          z: cz,
+          startX: cx,
+          startZ: cz,
+          vx: 0,
+          vz: 0,
+          vy: 0,
+          yOffset: 0,
+          health: 1,
+          maxHealth: 1,
+          speed: 0,
+          isBoss: false,
+          brain: 'Guardian',
+          alive: true,
+          opened: false,
+          dialogue: '',
+          dialogueLines: [],
+          chatStyle: resolveChatBubbleStyle(undefined, 'treasure'),
+          lastProximityVoiceAt: -99999,
+          headHeight: 1.4,
+          aggroShouted: false,
+          lowHpShouted: false,
+          patrolDir: 1,
+          attackCooldown: 0,
+          aiState: 'patrol',
+          stateTimer: 0,
+          attackDirX: 0,
+          attackDirZ: 1,
+          strikeDidHit: false,
+          hitFlashTimer: 0,
+          recoilPitch: 0,
+          recoilRoll: 0,
+          walkPhase: 0,
+          defeatSpin: 0,
+          activeAttack: 'clawSlash',
+          attackCycleCount: 0,
+          regenTimer: 0,
+          pickupable: false,
+          pickupQty: 1,
+          giftGiven: false,
+          mechanisms: [],
+          mechController: null,
+          mechNearState: {},
+          mechFlagFired: {},
+          chestAnim,
+          chestLootEntries: entries,
+          chestOpening: false,
+          chestOpenTimer: 0,
+          fxRuntime: null,
+          isBuddy: false,
+          warmedUp: false,
+          critterCelebrateTimer: 0,
+          lastCritterReactAt: -99999,
+          recruited: false,
+          creatureRefs: null,
+          floatSpinMeshes: [],
+          cards: [],
+          propPreset: undefined,
+          entityYaw: chestMesh.rotation.y,
+          entityScale: 1.35,
+          flightY: 0,
+          targetFlightY: 0,
+          patrolAngle: 0,
+          lockedTargetX: cx,
+          lockedTargetZ: cz,
+          varietyCooldownMult: 1,
+          behaviorChaseOrdered: false,
+          behaviorFleeOrdered: false,
+          behaviorAttackQueue: null,
+          enraged: false,
+          dyingDuration: 1.0,
+          deathFinalized: false,
+          keyFillColor: '#FACC15',
+          keyBorderColor: '#F59E0B',
+          airAttacksSinceLand: 0,
+          postAirHoverTimer: 0,
+          groundedHoldTimer: 0,
+          mustLandBeforeAttack: false,
+        });
+        spawnCombatSparks(cx, cy + 0.85, cz, '#FACC15', 20, 6.2);
+      };
 
       const buddyEntities = runtimeEntities.filter((r) => r.isBuddy);
 
@@ -3147,6 +3876,9 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
 
       const runInit = roguelikeRunRef.current;
       const initRelicMods = isRoguelikeLevel ? aggregateRelicModifiers(runInit.activeRelics) : null;
+      const heroProfile = resolveHeroProfile(activeProject);
+      const heroSkillSet = new Set(heroProfile.skills);
+      const maxStamina = Math.max(40, Math.round(heroProfile.stats.staminaMax));
       const baseStartMaxHealth = isRoguelikeLevel
         ? Math.max(
             2,
@@ -3155,7 +3887,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 DEFAULT_ROGUELIKE_CONFIG.startingMaxHealth
             )
           )
-        : 6;
+        : Math.max(3, Math.round(heroProfile.stats.maxHealth));
       let maxHealth = carryStats?.maxHealth ?? resumeSaved?.maxHealth ?? (baseStartMaxHealth + (initRelicMods?.maxHealthBonus ?? 0));
       let health =
         carryStats?.health ??
@@ -3163,7 +3895,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
         (isRoguelikeLevel
           ? Math.min(maxHealth, Math.max(1, runInit.currentHealth))
           : maxHealth);
-      let stamina = 100;
+      let stamina = maxStamina;
       let staminaExhausted = false;
       let lastStaminaToast = -10;
       let energy = 100;
@@ -3203,6 +3935,10 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       let shakeTimer = 0;
 
       liveStatsGetterRef.current = () => ({ coins, keys, health, maxHealth });
+      liveGrantCurrencyRef.current = (coinDelta: number, keyDelta: number) => {
+        if (coinDelta) coins += coinDelta;
+        if (keyDelta) keys += keyDelta;
+      };
       sameLevelTravelFnRef.current = (target: SavePlinthTarget) => {
         const [destX, destZ] = resolveHorizontalCollision(
           activeLevel,
@@ -3586,11 +4322,42 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       let lastPubSpeed: number | undefined = undefined;
       let lastHarvestPromptKey = '';
       let lastDoorPromptKey = '';
+      let lastChestPromptKey = '';
+      let openingChestId: string | null = null;
       let lastSitPromptKey = '';
       let lastClimbPromptKey = '';
       let lastGlidePromptKey: 'ready' | 'readySecond' | 'gliding' | '' = '';
       let lastNearCraftingBench = false;
       let armorBlockCounter = 0;
+
+      // Hero knockdown (fall on rump + bounce + get up), elemental residual statuses, & boss victory celebration
+      let heroKnockdownPhase: 'none' | 'fall' | 'bounce' | 'stun' | 'getup' = 'none';
+      let heroKnockdownTimer = 0;
+      const heroStatusTimers: ActiveHeroEffectTimers = {
+        burn: 0,
+        freeze: 0,
+        shock: 0,
+        poison: 0,
+        soak: 0,
+      };
+      let heroStatusTickAccum = 0;
+      let heroVictoryTimer = 0;
+      let bossVictoryBannerTimer = -99;
+      let lastStatusBannerKey = '';
+      let lastTraitBannerKey = '';
+      let heroEnvEvalTimer = 0;
+      let heroEnvEval: HeroEnvEvalResult = {
+        speedMult: heroProfile.stats.moveSpeedMult,
+        climbSpeedMult: heroProfile.stats.moveSpeedMult,
+        swimSpeedMult: heroProfile.stats.moveSpeedMult,
+        jumpMult: heroProfile.stats.jumpPowerMult,
+        staminaDrainMult: 1,
+        staminaRegenMult: heroProfile.stats.staminaRegenMult,
+        ambientTemp: 'temperate',
+        activeTerrainKey: 'grassland',
+        activeSummary: '',
+        activeTone: 'neutral',
+      };
 
       let isGliding = false;
       let airJumpPresses = 0;
@@ -3656,6 +4423,9 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       let prevHeroFloorY = heroY;
       let isClimbingStairs = false;
       let hasNearbyInteractablePrev = false;
+      let shieldGuardTimer = 0;
+      let interactConsumedLock = false;
+      let wasBlockingCustom = false;
       const choppedStumps: {
         id: string;
         x: number;
@@ -3775,8 +4545,24 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           }
 
           // Live equipment & Roguelike relic bonuses
+          shieldGuardTimer = Math.max(0, shieldGuardTimer - dt);
+          let isShieldBlockingNow = false;
           const eqNow = equipmentRef.current;
           const heldDefNow = eqNow.heldItemId ? itemByIdRef.current.get(eqNow.heldItemId) ?? null : null;
+          const offhandDefNow = eqNow.offhandItemId
+            ? itemByIdRef.current.get(eqNow.offhandItemId) ?? null
+            : null;
+          const twoHandedHeldNow = Boolean(
+            heldDefNow?.handedness === 'twoHand' ||
+              heldDefNow?.toolKind === 'axe' ||
+              heldDefNow?.toolKind === 'fishingPole'
+          );
+          const activeOffhandDefNow = !twoHandedHeldNow ? offhandDefNow : null;
+          const hasUsableShield = Boolean(
+            activeOffhandDefNow &&
+              (activeOffhandDefNow.wearSlot === 'offhand' ||
+                typeof activeOffhandDefNow.blockReduction === 'number')
+          );
           const headDefNow = eqNow.headItemId ? itemByIdRef.current.get(eqNow.headItemId) ?? null : null;
           const bodyDefNow = eqNow.bodyItemId ? itemByIdRef.current.get(eqNow.bodyItemId) ?? null : null;
           const accDefNow = eqNow.accessoryItemId ? itemByIdRef.current.get(eqNow.accessoryItemId) ?? null : null;
@@ -3785,6 +4571,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             : null;
 
           const wearMaxHpBonus =
+            (activeOffhandDefNow?.maxHealthBonus ?? 0) +
             (headDefNow?.maxHealthBonus ?? 0) +
             (bodyDefNow?.maxHealthBonus ?? 0) +
             (accDefNow?.maxHealthBonus ?? 0) +
@@ -3797,25 +4584,222 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           health = Math.min(health, maxHealth);
 
           const heroAttackDamage =
-            1 +
+            heroProfile.stats.baseAttack +
+            (heroSkillSet.has('powerStrike') ? 1 : 0) +
+            (heroSkillSet.has('glassCannon') ? 2 : 0) +
             (heldDefNow?.attackBonus ?? 0) +
             (headDefNow?.attackBonus ?? 0) +
             (bodyDefNow?.attackBonus ?? 0) +
             (accDefNow?.attackBonus ?? 0) +
             (relicMods?.attackBonus ?? 0);
-          const heroDefensePower =
-            (heldDefNow?.defenseBonus ?? 0) +
-            (headDefNow?.defenseBonus ?? 0) +
-            (bodyDefNow?.defenseBonus ?? 0) +
-            (accDefNow?.defenseBonus ?? 0) +
-            (relicMods?.defenseBonus ?? 0);
-          const heroSpeedMult =
-            1 +
+          const heroDefensePower = Math.max(
+            0,
+            heroProfile.stats.baseDefense +
+              (heroSkillSet.has('heavyArmorClumsy') ? 1 : 0) -
+              (heroSkillSet.has('glassCannon') ? 1 : 0) +
+              (heldDefNow?.defenseBonus ?? 0) +
+              (activeOffhandDefNow?.defenseBonus ?? 0) +
+              (headDefNow?.defenseBonus ?? 0) +
+              (bodyDefNow?.defenseBonus ?? 0) +
+              (accDefNow?.defenseBonus ?? 0) +
+              (relicMods?.defenseBonus ?? 0)
+          );
+
+          heroEnvEvalTimer -= dt;
+          if (heroEnvEvalTimer <= 0) {
+            heroEnvEvalTimer = 0.16;
+            const curLayer = sampleTerrainLayer(activeLevel.terrain, heroX, heroZ);
+            const curWeathering = sampleTerrainWeathering(activeLevel.terrain, heroX, heroZ);
+            const curFloorForEval = sampleLevelHeight(activeLevel, heroX, heroZ);
+            const curWaterDepth = env === 'openWorld' ? IslandTerrain.waterLevel - curFloorForEval : 0;
+            const curInCave =
+              terrainHasMainMountainCave(activeLevel.terrain) && isInsideMountainCave(heroX, heroZ);
+            heroEnvEval = evaluateHeroEnvironmentModifiers(
+              heroProfile,
+              activeLevel,
+              env,
+              curLayer,
+              curWeathering,
+              curWaterDepth,
+              isSwimming,
+              isClimbing,
+              heroY,
+              liveHour,
+              curInCave,
+              heroStatusTimers.burn > 0
+            );
+            const nextTraitKey =
+              heroEnvEval.activeSummary && heroEnvEval.activeTone !== 'neutral'
+                ? `${heroEnvEval.activeTone}:${heroEnvEval.activeSummary}`
+                : '';
+            if (nextTraitKey !== lastTraitBannerKey) {
+              lastTraitBannerKey = nextTraitKey;
+              if (!nextTraitKey || heroEnvEval.activeTone === 'neutral') {
+                setHeroTraitBanner(null);
+              } else {
+                setHeroTraitBanner({
+                  label: heroEnvEval.activeSummary,
+                  tone: heroEnvEval.activeTone,
+                });
+              }
+            }
+          }
+
+          const heroSpeedMultBase =
+            (isSwimming
+              ? heroEnvEval.swimSpeedMult
+              : isClimbing
+              ? heroEnvEval.climbSpeedMult
+              : heroEnvEval.speedMult) +
+            (activeOffhandDefNow?.speedBonus ?? 0) +
             (headDefNow?.speedBonus ?? 0) +
             (bodyDefNow?.speedBonus ?? 0) +
             (accDefNow?.speedBonus ?? 0) +
             (relicMods?.speedBonus ?? 0);
-          const staminaRegenMult = 1 + (relicMods?.staminaRegenMult ?? 0);
+          const staminaRegenMult = heroEnvEval.staminaRegenMult + (relicMods?.staminaRegenMult ?? 0);
+
+          const triggerHeroDeath = () => {
+            if (isRoguelikeLevel) {
+              const snap = roguelikeRunRef.current;
+              const summary = {
+                floorReached: snap.floorNumber,
+                enemiesSlain: snap.enemiesSlain,
+                bossesSlain: snap.bossesSlain,
+                coinsEarned: coins,
+                relicIds: snap.activeRelics,
+                runSeed: snap.runSeed,
+              };
+              const nextSnap = { ...snap, currentHealth: 0, coinsEarned: coins, runSummary: summary };
+              roguelikeRunRef.current = nextSnap;
+              setRoguelikeRun(nextSnap);
+            }
+            setDead(true);
+          };
+
+          // Advance hero knockdown (fall onto rump -> bounce -> dazed -> animated get-up)
+          const knockdownDurFactor = heroSkillSet.has('ironResolve') ? 0.65 : 1;
+          if (heroKnockdownPhase !== 'none') {
+            heroKnockdownTimer -= dt;
+            if (heroKnockdownTimer <= 0) {
+              if (heroKnockdownPhase === 'fall') {
+                heroKnockdownPhase = 'bounce';
+                heroKnockdownTimer = 0.22 * knockdownDurFactor;
+                heroEffects.emitKnockdownImpact(heroX, heroY, heroZ);
+                AudioEngine.playSound('hit');
+              } else if (heroKnockdownPhase === 'bounce') {
+                heroKnockdownPhase = 'stun';
+                heroKnockdownTimer = 0.44 * knockdownDurFactor;
+              } else if (heroKnockdownPhase === 'stun') {
+                heroKnockdownPhase = 'getup';
+                heroKnockdownTimer = 0.42 * knockdownDurFactor;
+              } else {
+                heroKnockdownPhase = 'none';
+                heroKnockdownTimer = 0;
+              }
+            }
+          }
+
+          // Advance Boss Victory banner & celebration sparkles
+          if (heroVictoryTimer > 0) {
+            heroVictoryTimer = Math.max(0, heroVictoryTimer - dt);
+            heroEffects.emitVictorySparkles(heroX, heroY, heroZ, dt);
+          }
+          if (bossVictoryBannerTimer > -50) {
+            bossVictoryBannerTimer -= dt;
+            if (bossVictoryBannerTimer <= 0) {
+              bossVictoryBannerTimer = -99;
+              setBossVictoryBanner(null);
+            }
+          }
+
+          // Advance hero elemental status timers (burn, freeze, shock, poison, soak)
+          if (heroStatusTimers.burn > 0) heroStatusTimers.burn = Math.max(0, heroStatusTimers.burn - dt);
+          if (heroStatusTimers.freeze > 0) heroStatusTimers.freeze = Math.max(0, heroStatusTimers.freeze - dt);
+          if (heroStatusTimers.shock > 0) heroStatusTimers.shock = Math.max(0, heroStatusTimers.shock - dt);
+          if (heroStatusTimers.poison > 0) heroStatusTimers.poison = Math.max(0, heroStatusTimers.poison - dt);
+          if (heroStatusTimers.soak > 0) heroStatusTimers.soak = Math.max(0, heroStatusTimers.soak - dt);
+
+          const hasDotStatus =
+            heroStatusTimers.burn > 0 || heroStatusTimers.shock > 0 || heroStatusTimers.poison > 0;
+          if (hasDotStatus) {
+            heroStatusTickAccum += dt;
+            if (heroStatusTickAccum >= 1.65) {
+              heroStatusTickAccum = 0;
+              if (health > 1) {
+                health -= 1;
+                AudioEngine.playSound(heroStatusTimers.shock > 0 ? 'sparkle' : 'hurt');
+                if (heroStatusTimers.burn > 0) {
+                  showToast('Burning! Flames & soot scorch you (-1 HP)');
+                } else if (heroStatusTimers.shock > 0) {
+                  showToast('Shocked! Electric current jolts you (-1 HP)');
+                } else {
+                  showToast('Poisoned! Venom drains your strength (-1 HP)');
+                }
+              } else if (heroStatusTimers.burn > 0 || heroStatusTimers.shock > 0 || heroStatusTimers.poison > 0) {
+                // Allow elemental DoT to finish off a critically low hero if not healed/cured
+                health = 0;
+                triggerHeroDeath();
+              }
+            }
+          } else {
+            heroStatusTickAccum = 0;
+          }
+
+          heroEffects.updateHeroStatuses(heroX, heroY, heroZ, dt, heroStatusTimers);
+          heroEffects.tick(dt);
+
+          const heroStatusSlow =
+            heroStatusTimers.freeze > 0
+              ? 0.58
+              : heroStatusTimers.soak > 0
+              ? 0.8
+              : heroStatusTimers.shock > 0
+              ? 0.86
+              : heroStatusTimers.burn > 0
+              ? 0.94
+              : 1;
+          const heroSpeedMult = heroSpeedMultBase * heroStatusSlow;
+          const heroDefensePenalty =
+            (heroStatusTimers.freeze > 0 ? 1 : 0) +
+            (heroStatusTimers.burn > 0 ? 1 : 0) +
+            (heroStatusTimers.shock > 0 ? 1 : 0) +
+            (heroStatusTimers.poison > 0 ? 1 : 0);
+          const effectiveHeroDefense = Math.max(0, heroDefensePower - heroDefensePenalty);
+
+          // Sync clean status pill only on transitions
+          const nextStatusKind: HeroStatusEffectKind | 'knockdown' | '' =
+            heroKnockdownPhase !== 'none'
+              ? 'knockdown'
+              : heroStatusTimers.burn > 0
+              ? 'burn'
+              : heroStatusTimers.freeze > 0
+              ? 'freeze'
+              : heroStatusTimers.shock > 0
+              ? 'shock'
+              : heroStatusTimers.poison > 0
+              ? 'poison'
+              : heroStatusTimers.soak > 0
+              ? 'soak'
+              : '';
+          if (nextStatusKind !== lastStatusBannerKey) {
+            lastStatusBannerKey = nextStatusKind;
+            if (!nextStatusKind) {
+              setHeroStatusBanner(null);
+            } else {
+              const statusLabelMap: Record<HeroStatusEffectKind | 'knockdown', string> = {
+                knockdown: heroKnockdownPhase === 'stun' ? 'Knocked Down & Dazed!' : 'Knocked Down!',
+                burn: 'On Fire (Burn · -1 Def)',
+                freeze: 'Frozen (Slowed · -1 Def)',
+                shock: 'Electrified (Shock · -1 Def)',
+                poison: 'Poisoned (-1 Def)',
+                soak: 'Drenched (Slowed)',
+              };
+              setHeroStatusBanner({
+                kind: nextStatusKind,
+                label: statusLabelMap[nextStatusKind],
+              });
+            }
+          }
 
           const recordRoguelikeEnemyKill = (rt: RuntimeEntity) => {
             if (!isRoguelikeLevel) return;
@@ -3844,28 +4828,116 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             setRoguelikeRun(nextSnap);
           };
 
-          const triggerHeroDeath = () => {
-            if (isRoguelikeLevel) {
-              const snap = roguelikeRunRef.current;
-              const summary = {
-                floorReached: snap.floorNumber,
-                enemiesSlain: snap.enemiesSlain,
-                bossesSlain: snap.bossesSlain,
-                coinsEarned: coins,
-                relicIds: snap.activeRelics,
-                runSeed: snap.runSeed,
-              };
-              const nextSnap = { ...snap, currentHealth: 0, coinsEarned: coins, runSummary: summary };
-              roguelikeRunRef.current = nextSnap;
-              setRoguelikeRun(nextSnap);
+          const beginBaddieDeath = (rt: RuntimeEntity, knockX: number, knockZ: number) => {
+            if (!rt.alive || rt.aiState === 'dying') return;
+            rt.aiState = 'dying';
+            rt.dyingDuration = rt.isBoss ? 1.45 : 0.95;
+            rt.stateTimer = rt.dyingDuration;
+            rt.deathFinalized = false;
+            rt.vx = knockX * (rt.isBoss ? 5.2 : 10.2);
+            rt.vz = knockZ * (rt.isBoss ? 5.2 : 10.2);
+            rt.vy = rt.isBoss ? 1.1 : 3.4;
+            rt.defeatSpin = rt.quadrupedRig ? 0 : (Math.random() > 0.5 ? 1 : -1) * 7.5;
+            hitStopTimer = rt.isBoss ? 0.085 : 0.055;
+            shakeTimer = Math.max(shakeTimer, rt.isBoss ? 0.36 : 0.2);
+
+            if (rt.hpBar) {
+              redrawEnemyHealthBar(rt.hpBar, 0, rt.maxHealth, rt.hpBar.displayTrail);
             }
-            setDead(true);
+            const deathY = Math.max(-0.5, sampleLevelHeight(activeLevel, rt.x, rt.z)) + rt.flightY;
+            heroEffects.emitBossDeathBurst(
+              rt.x,
+              deathY,
+              rt.z,
+              rt.keyFillColor || '#EA580C',
+              rt.keyBorderColor || '#FBBF24'
+            );
+            spawnCombatSparks(rt.x, deathY + 0.9, rt.z, '#FFD166', rt.isBoss ? 18 : 11, 8.0);
+            coins += rt.isBoss ? 10 : 2;
+            recordRoguelikeEnemyKill(rt);
+            if (rt.pickupable && rt.pickupItemId) {
+              const gy = sampleLevelHeight(activeLevel, rt.x, rt.z);
+              spawnDroppedItem(
+                rt.pickupItemId,
+                rt.pickupQty,
+                rt.x,
+                gy + 0.5,
+                rt.z,
+                knockX * 2.5,
+                4.6,
+                knockZ * 2.5
+              );
+            }
+            if (rt.isBoss) {
+              heroVictoryTimer = 2.8;
+              bossVictoryBannerTimer = 4.2;
+              AudioEngine.playSound('chime');
+              AudioEngine.playSound('sparkle');
+              spawnBossRewardChest(rt);
+              setBossVictoryBanner({
+                bossName: rt.name,
+                coins: rt.baddieAI?.bossRewardCoins ?? 30,
+              });
+              showToast(`Victory! ${rt.name} defeated — open the Great Treasure Chest!`);
+            } else {
+              showToast(`Defeated ${rt.name}!`);
+            }
+          };
+
+          const applyBaddieAttackEffectToHero = (
+            actionDef: BaddieActionDef,
+            kbDirX: number,
+            kbDirZ: number,
+            wasDeflected: boolean,
+            effectDurationMult = 1,
+            shieldBlocked = false
+          ) => {
+            if (wasDeflected && !shieldBlocked && actionDef.heroEffect !== 'knockdown') return;
+            const eff = actionDef.heroEffect;
+            if (eff === 'knockdown') {
+              if (shieldBlocked) {
+                heroRecoilTimer = Math.max(heroRecoilTimer, 0.14);
+                showToast('Shield braced against the slam!');
+                return;
+              }
+              heroKnockdownPhase = 'fall';
+              heroKnockdownTimer = 0.28;
+              isSitting = false;
+              isClimbing = false;
+              attackAnimTimer = 0;
+              shieldGuardTimer = 0;
+              const kbScale = heroSkillSet.has('ironResolve') ? 0.72 : 1;
+              heroKnockVX = kbDirX * actionDef.knockbackForce * kbScale;
+              heroKnockVZ = kbDirZ * actionDef.knockbackForce * kbScale;
+              if (!isSwimming) {
+                heroVelY = Math.max(heroVelY, 2.8);
+              }
+              heroEffects.emitKnockdownImpact(heroX, heroY, heroZ);
+              showToast('Slammed off your feet!');
+            } else if (eff === 'burn' || eff === 'freeze' || eff === 'shock' || eff === 'poison' || eff === 'soak') {
+              const durScale = shieldBlocked ? effectDurationMult * 0.45 : effectDurationMult;
+              heroStatusTimers[eff] = Math.max(
+                heroStatusTimers[eff],
+                actionDef.effectDurationSec * durScale
+              );
+              if (eff === 'burn') {
+                showToast('Scorched! Flames & soot cling to you!');
+              } else if (eff === 'freeze') {
+                showToast('Frostbitten! Ice chills your speed & defense!');
+              } else if (eff === 'shock') {
+                showToast('Shocked! Soot & electric current surge through you!');
+              } else if (eff === 'poison') {
+                showToast('Venomed! Toxic mist weakens your guard!');
+              } else if (eff === 'soak') {
+                showToast('Soaked! Heavy spray slows your stride!');
+              }
+            }
           };
 
           if (pendingConsumeRef.current.length > 0) {
             for (const c of pendingConsumeRef.current) {
               health = Math.min(maxHealth, health + c.heal);
-              stamina = Math.min(100, stamina + c.stamina);
+              stamina = Math.min(maxStamina, stamina + c.stamina);
               magic = Math.min(100, magic + c.magic);
               staminaExhausted = false;
             }
@@ -4155,14 +5227,31 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           const fishingLocksMove =
             fishingState.phase === 'casting' || fishingState.phase === 'reeling';
           const cutawayLocksMove = cutawayHeroLockRef.current;
+          const chestLocksMove = Boolean(openingChestId || chestOpeningLockRef.current);
+          const knockdownLocksMove = heroKnockdownPhase !== 'none';
           const canWalk =
             (enabledSet.has('walk') || enabledSet.has('run')) &&
             !fishingLocksMove &&
-            !cutawayLocksMove;
-          if (cutawayLocksMove) {
+            !cutawayLocksMove &&
+            !chestLocksMove &&
+            !knockdownLocksMove;
+          if (cutawayLocksMove || chestLocksMove || knockdownLocksMove) {
             inp.jumpQueued = false;
             inp.attackQueued = false;
             inp.magicQueued = false;
+            if (chestLocksMove) {
+              inp.interactQueued = false;
+              const openChestRt = openingChestId
+                ? runtimeEntities.find((r) => r.id === openingChestId)
+                : null;
+              if (openChestRt) {
+                const targetYaw = Math.atan2(openChestRt.x - heroX, openChestRt.z - heroZ);
+                let diff = targetYaw - heroYaw;
+                while (diff > Math.PI) diff -= Math.PI * 2;
+                while (diff < -Math.PI) diff += Math.PI * 2;
+                heroYaw += diff * Math.min(1, dt * 10);
+              }
+            }
           }
           const canSwim = env === 'openWorld' && activeLevel.canSwim !== false;
 
@@ -4188,24 +5277,54 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             inp.keys.has('AltLeft') ||
             inp.keys.has('AltRight') ||
             inp.interactPointerDown;
+          if (!useHeld && !inp.interactQueued) {
+            interactConsumedLock = false;
+          }
+          const canRaiseShieldNow =
+            !isDriving &&
+            !isGliding &&
+            !isSwimming &&
+            !isSitting &&
+            !isClimbing &&
+            heroKnockdownPhase === 'none' &&
+            attackAnimTimer <= 0 &&
+            hasUsableShield;
+          if (
+            canRaiseShieldNow &&
+            !hasNearbyInteractablePrev &&
+            !interactConsumedLock &&
+            heldDefNow?.toolKind !== 'fishingPole'
+          ) {
+            if (inp.interactQueued) {
+              shieldGuardTimer = 0.85;
+            } else if (useHeld) {
+              shieldGuardTimer = Math.max(shieldGuardTimer, 0.2);
+            }
+          }
+          isShieldBlockingNow = shieldGuardTimer > 0 && canRaiseShieldNow;
           const energySpeedMult = energy <= 0 ? 0.78 : 1;
           const wantsRun =
             (joyMag > 0.85 ||
-              (useHeld && !isGliding && !hasNearbyInteractablePrev && effectiveMoveMag > 0.08)) &&
+              (useHeld &&
+                !isShieldBlockingNow &&
+                !isGliding &&
+                !hasNearbyInteractablePrev &&
+                effectiveMoveMag > 0.08)) &&
             enabledSet.has('run') &&
             !isSitting &&
             !isClimbing &&
             !isGliding &&
             energy > 0.5;
           isRunning = wantsRun && !staminaExhausted && stamina > 0.5 && effectiveMoveMag > 0.08;
+          const shieldBraceSpeedMult = isShieldBlockingNow ? 0.72 : 1;
           const moveSpeed =
             (isSwimming
               ? isRunning
                 ? 5.8
                 : 3.9
               : isRunning
-              ? 7.4
-              : 3.6) *
+              ? 7.4 * (heroSkillSet.has('swiftFootwork') ? 1.14 : 1)
+              : 3.6 * shieldBraceSpeedMult) *
             heroSpeedMult *
             energySpeedMult;
 
@@ -4340,12 +5459,12 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             isClimbingStairs = false;
             floorY = sampleLevelHeight(activeLevel, heroX, heroZ);
             energy = Math.min(100, energy + dt * 16);
-            stamina = Math.min(100, stamina + dt * 32 * staminaRegenMult);
+            stamina = Math.min(maxStamina, stamina + dt * 32 * staminaRegenMult);
           } else if (isClimbing) {
             floorY = sampleLevelHeight(activeLevel, heroX, heroZ);
             const vertInput = THREE.MathUtils.clamp(-moveZ, -1, 1);
             const sideInput = THREE.MathUtils.clamp(moveX, -1, 1);
-            const climbSpeed = 3.4 * energySpeedMult;
+            const climbSpeed = 3.4 * heroEnvEval.climbSpeedMult * energySpeedMult;
 
             if (climbKind === 'tree' || climbKind === 'entity') {
               heroYaw = Math.atan2(climbAnchorX - heroX, climbAnchorZ - heroZ);
@@ -4375,7 +5494,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             jumpsUsed = 0;
             isSwimming = false;
             isClimbingStairs = false;
-            stamina = Math.max(0, stamina - (Math.abs(vertInput) > 0.1 ? 6 : 1.5) * dt);
+            stamina = Math.max(0, stamina - (Math.abs(vertInput) > 0.1 ? 6 : 1.5) * heroEnvEval.staminaDrainMult * dt);
             energy = Math.max(0, energy - 0.45 * dt);
 
             if (inp.jumpQueued) {
@@ -4481,15 +5600,15 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             const glideDZ = Math.cos(heroYaw);
             const [resolvedX, resolvedZ] = resolveHorizontalCollision(
               activeLevel,
-              heroX + glideDX * glideAirSpeed * heroSpeedMult * dt,
-              heroZ + glideDZ * glideAirSpeed * heroSpeedMult * dt,
+              heroX + glideDX * glideAirSpeed * heroSpeedMult * (heroSkillSet.has('acrobat') ? 1.18 : 1) * dt,
+              heroZ + glideDZ * glideAirSpeed * heroSpeedMult * (heroSkillSet.has('acrobat') ? 1.18 : 1) * dt,
               0.62,
               canSwim,
               collisionCtx
             );
             heroX = resolvedX;
             heroZ = resolvedZ;
-            stamina = Math.min(100, stamina + dt * 14 * staminaRegenMult);
+            stamina = Math.min(maxStamina, stamina + dt * 14 * staminaRegenMult);
           } else if (isFirstPersonControl && canWalk) {
             glideBankRoll = THREE.MathUtils.damp(glideBankRoll, 0, 10, dt);
             collisionCtx.actorY = heroY;
@@ -4520,7 +5639,10 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               heroZ = resolvedZ;
 
               if (isRunning) {
-                stamina = Math.max(0, stamina - dt * (isSwimming ? 14 : 24));
+                stamina = Math.max(
+                  0,
+                  stamina - dt * (isSwimming ? 14 : 24) * heroEnvEval.staminaDrainMult
+                );
                 if (stamina <= 0) {
                   stamina = 0;
                   staminaExhausted = true;
@@ -4530,7 +5652,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   }
                 }
               } else {
-                stamina = Math.min(100, stamina + dt * 11 * staminaRegenMult);
+                stamina = Math.min(maxStamina, stamina + dt * 11 * staminaRegenMult);
               }
 
               stepTimer += dt;
@@ -4544,7 +5666,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 AudioEngine.playSound(activeLevel.audio.step);
               }
             } else {
-              stamina = Math.min(100, stamina + dt * 26 * staminaRegenMult);
+              stamina = Math.min(maxStamina, stamina + dt * 26 * staminaRegenMult);
             }
           } else if (mag > 0.08 && canWalk) {
             glideBankRoll = THREE.MathUtils.damp(glideBankRoll, 0, 10, dt);
@@ -4608,7 +5730,10 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             heroZ = resolvedZ;
 
             if (isRunning) {
-              stamina = Math.max(0, stamina - dt * (isSwimming ? 14 : 24));
+              stamina = Math.max(
+                0,
+                stamina - dt * (isSwimming ? 14 : 24) * heroEnvEval.staminaDrainMult
+              );
               if (stamina <= 0) {
                 stamina = 0;
                 staminaExhausted = true;
@@ -4619,7 +5744,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               }
             } else {
               // Walking or relaxed swimming slowly recovers stamina so player catches breath
-              stamina = Math.min(100, stamina + dt * 11 * staminaRegenMult);
+              stamina = Math.min(maxStamina, stamina + dt * 11 * staminaRegenMult);
             }
 
             stepTimer += dt;
@@ -4634,7 +5759,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             }
           } else {
             glideBankRoll = THREE.MathUtils.damp(glideBankRoll, 0, 10, dt);
-            stamina = Math.min(100, stamina + dt * 26 * staminaRegenMult);
+            stamina = Math.min(maxStamina, stamina + dt * 26 * staminaRegenMult);
           }
 
           // Apply physical knockback impulse on hero when bumped by an enemy attack
@@ -4799,7 +5924,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             if (isSwimming) {
               isSwimming = false;
               swimReenterCooldown = 0.36;
-              heroVelY = 9.6;
+              heroVelY = 9.6 * heroEnvEval.jumpMult;
               jumpsUsed = 1;
               airJumpPresses = Math.max(1, airJumpPresses);
               coyoteTimer = 0;
@@ -4807,14 +5932,14 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               AudioEngine.playSound(activeLevel.audio.jump);
               AudioEngine.playSound('splash');
             } else if (coyoteTimer > 0) {
-              heroVelY = 10.6;
+              heroVelY = 10.6 * heroEnvEval.jumpMult;
               jumpsUsed = 1;
               airJumpPresses = Math.max(1, airJumpPresses);
               coyoteTimer = 0;
               jumpBufferTimer = 0;
               AudioEngine.playSound(activeLevel.audio.jump);
             } else if (jumpsUsed < maxJumps) {
-              heroVelY = 10.0;
+              heroVelY = 10.0 * heroEnvEval.jumpMult;
               jumpsUsed++;
               airJumpPresses = Math.max(2, airJumpPresses);
               jumpBufferTimer = 0;
@@ -5040,6 +6165,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           if (activeHeroEquipment) {
             syncHeroEquipmentVisuals(activeHeroEquipment, {
               heldDef: heldDefNow,
+              offhandDef: activeOffhandDefNow,
               headDef: headDefNow,
               bodyDef: bodyDefNow,
               accDef: accDefNow,
@@ -5047,6 +6173,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               isAttacking: attackAnimTimer > 0,
               isFishingActive: fishingState.phase !== 'idle',
               isGliding,
+              isBlocking: isShieldBlockingNow,
             });
           }
 
@@ -5063,14 +6190,25 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 steerBank: glideBankRoll,
               });
               wasGlidingCustom = true;
-            } else if (wasGlidingCustom) {
+              wasBlockingCustom = false;
+            } else if (isShieldBlockingNow) {
+              heroCustom.setTestOverride({
+                kind: 'block',
+                speedNorm: moving ? locoVelocityRatio : 0,
+              });
+              wasBlockingCustom = true;
+              wasGlidingCustom = false;
+            } else if (wasGlidingCustom || wasBlockingCustom) {
               heroCustom.setTestOverride(null);
               wasGlidingCustom = false;
+              wasBlockingCustom = false;
             }
-            if (isSitting) heroCustom.setAction('sit', 0.12);
+            if (heroKnockdownPhase !== 'none') heroCustom.setAction('sit', 0.1);
+            else if (isSitting) heroCustom.setAction('sit', 0.12);
             else if (isClimbing) heroCustom.setAction('climbVertical', 0.12);
             else if (attackAnimTimer > 0)
               heroCustom.setAction(activeAttackKind === 'axe' ? 'swing' : 'attack', 0.08);
+            else if (heroVictoryTimer > 0) heroCustom.setAction('interact', 0.12);
             else if (inp.emoteTimer > 0) heroCustom.setAction('interact', 0.12);
             else if (isSwimming) heroCustom.setAction('swim', 0.14);
             else if (isTrulyAirborne) heroCustom.setAction('jump', 0.1);
@@ -5079,7 +6217,17 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             else if (moving) heroCustom.setAction('walk', 0.16);
             else heroCustom.setAction('idle', 0.18);
 
-            if (!heroCustom.clips.swim && heroCustom.group.children[0]) {
+            if (heroKnockdownPhase !== 'none' && heroCustom.group.children[0]) {
+              const kdTilt =
+                heroKnockdownPhase === 'fall'
+                  ? -0.85
+                  : heroKnockdownPhase === 'bounce'
+                  ? -0.68
+                  : heroKnockdownPhase === 'stun'
+                  ? -0.58
+                  : -0.25;
+              heroCustom.group.children[0].rotation.x = kdTilt;
+            } else if (!heroCustom.clips.swim && heroCustom.group.children[0]) {
               heroCustom.group.children[0].rotation.x = swimTiltX * 0.72;
             } else if (heroCustom.group.children[0]) {
               heroCustom.group.children[0].rotation.x = recoilTilt * 0.75;
@@ -5109,21 +6257,74 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               THREE.MathUtils.damp(cur, target, lambda, dt);
 
             let targetBodyY = 0;
+            let targetBodyPitch = 0;
             let targetBodyYaw = 0;
             let targetBodyRoll = 0;
             let targetHeadX = isSwimming ? -swimTiltX * 0.7 : 0;
             let targetArmLX = 0;
+            let targetArmLY = 0;
             let targetArmLZ = 0;
             let targetArmRX = 0;
             let targetArmRY = 0;
             let targetArmRZ = 0;
             let targetForearmLX = -0.18;
+            let targetForearmLY = 0;
             let targetForearmRX = -0.18;
             let targetForearmRZ = 0;
             let targetLegLX = 0;
             let targetLegRX = 0;
 
-            if (isSitting) {
+            if (heroKnockdownPhase !== 'none') {
+              if (heroKnockdownPhase === 'fall') {
+                const p = Math.min(1, Math.max(0, 1 - heroKnockdownTimer / 0.28));
+                targetBodyY = -0.40 * p;
+                targetBodyPitch = -0.82 * p;
+                targetLegLX = -1.24 * p;
+                targetLegRX = -1.16 * p;
+                targetArmLX = -1.35 * p;
+                targetArmRX = -1.35 * p;
+                targetArmLZ = 0.68 * p;
+                targetArmRZ = -0.68 * p;
+                targetHeadX = -0.22 * p;
+              } else if (heroKnockdownPhase === 'bounce') {
+                const p = Math.min(1, Math.max(0, 1 - heroKnockdownTimer / 0.22));
+                const arc = Math.sin(p * Math.PI);
+                targetBodyY = -0.44 + arc * 0.16;
+                targetBodyPitch = -0.72 + arc * 0.18;
+                targetLegLX = -1.28 + arc * 0.22;
+                targetLegRX = -1.22 + arc * 0.22;
+                targetArmLX = 0.35 - arc * 0.45;
+                targetArmRX = 0.35 - arc * 0.45;
+                targetArmLZ = 0.62;
+                targetArmRZ = -0.62;
+                targetHeadX = -0.15 + arc * 0.15;
+              } else if (heroKnockdownPhase === 'stun') {
+                const wobble = Math.sin(gameElapsed * 13);
+                targetBodyY = -0.44;
+                targetBodyPitch = -0.44 + Math.sin(gameElapsed * 6.5) * 0.08;
+                targetBodyRoll = wobble * 0.09;
+                targetLegLX = -1.26;
+                targetLegRX = -1.20;
+                targetArmLX = 0.42;
+                targetArmRX = 0.42;
+                targetArmLZ = 0.45;
+                targetArmRZ = -0.45;
+                targetForearmLX = -0.22;
+                targetForearmRX = -0.22;
+                targetHeadX = 0.20;
+              } else {
+                const p = Math.min(1, Math.max(0, 1 - heroKnockdownTimer / 0.42));
+                const ease = p * p * (3 - 2 * p);
+                targetBodyY = THREE.MathUtils.lerp(-0.44, 0, ease);
+                targetBodyPitch = Math.sin(p * Math.PI) * 0.26;
+                targetLegLX = THREE.MathUtils.lerp(-1.15, 0, ease);
+                targetLegRX = THREE.MathUtils.lerp(-0.92, 0, ease);
+                targetArmLX = THREE.MathUtils.lerp(0.32, 0, ease);
+                targetArmRX = THREE.MathUtils.lerp(0.32, 0, ease);
+                targetArmLZ = THREE.MathUtils.lerp(0.4, 0, ease);
+                targetArmRZ = THREE.MathUtils.lerp(-0.4, 0, ease);
+              }
+            } else if (isSitting) {
               targetBodyY = -0.43;
               targetLegLX = -1.26;
               targetLegRX = -1.26;
@@ -5332,6 +6533,26 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   targetArmLX = THREE.MathUtils.lerp(0.26, -stride * 0.68, ease);
                   targetArmLZ = THREE.MathUtils.lerp(0.14, 0, ease);
                 }
+              } else if (isShieldBlockingNow) {
+                targetArmLX = -0.62;
+                targetArmLY = -0.68;
+                targetArmLZ = -0.24;
+                targetForearmLX = -1.05;
+                targetForearmLY = 0;
+                targetBodyYaw = 0.22;
+                if (!moving && heldDefNow) {
+                  targetArmRX = -0.42;
+                  targetForearmRX = -0.35;
+                }
+              } else if (heroVictoryTimer > 0 && !moving) {
+                const pump = Math.sin(gameElapsed * 9.5);
+                targetBodyY = Math.abs(Math.sin(gameElapsed * 5.2)) * 0.08;
+                targetArmRX = -2.55 + pump * 0.16;
+                targetArmRZ = -0.32;
+                targetForearmRX = -0.25;
+                targetArmLX = -2.18 - pump * 0.14;
+                targetArmLZ = 0.45;
+                targetHeadX = -0.2;
               } else if (heroRecoilTimer > 0) {
                 targetArmLX = -0.55;
                 targetArmRX = -0.55;
@@ -5355,24 +6576,30 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             }
 
             heroRig.bodyPivot.position.y = dampJoint(heroRig.bodyPivot.position.y, 0.85 + targetBodyY, 14);
-            heroRig.bodyPivot.rotation.x = isSitting
-              ? -0.05
-              : isClimbing
-              ? -0.1
-              : isGliding
-              ? 0.14
-              : swimTiltX;
+            const desiredBodyPitch =
+              heroKnockdownPhase !== 'none'
+                ? targetBodyPitch
+                : isSitting
+                ? -0.05
+                : isClimbing
+                ? -0.1
+                : isGliding
+                ? 0.14
+                : swimTiltX;
+            heroRig.bodyPivot.rotation.x = dampJoint(heroRig.bodyPivot.rotation.x, desiredBodyPitch, 16);
             heroRig.bodyPivot.rotation.y = dampJoint(heroRig.bodyPivot.rotation.y, targetBodyYaw, 18);
             heroRig.bodyPivot.rotation.z = dampJoint(heroRig.bodyPivot.rotation.z, targetBodyRoll, 10);
             heroRig.head.rotation.x = dampJoint(heroRig.head.rotation.x, targetHeadX, 10);
-            const armLambda = attackAnimTimer > 0 ? 30 : 13;
+            const armLambda = attackAnimTimer > 0 ? 30 : isShieldBlockingNow ? 22 : 13;
             heroRig.armL.rotation.x = dampJoint(heroRig.armL.rotation.x, targetArmLX, armLambda);
+            heroRig.armL.rotation.y = dampJoint(heroRig.armL.rotation.y, targetArmLY, armLambda);
             heroRig.armL.rotation.z = dampJoint(heroRig.armL.rotation.z, targetArmLZ, armLambda);
             heroRig.armR.rotation.x = dampJoint(heroRig.armR.rotation.x, targetArmRX, armLambda);
             heroRig.armR.rotation.y = dampJoint(heroRig.armR.rotation.y, targetArmRY, armLambda);
             heroRig.armR.rotation.z = dampJoint(heroRig.armR.rotation.z, targetArmRZ, armLambda);
             if (heroRig.forearmL) {
               heroRig.forearmL.rotation.x = dampJoint(heroRig.forearmL.rotation.x, targetForearmLX, armLambda);
+              heroRig.forearmL.rotation.y = dampJoint(heroRig.forearmL.rotation.y, targetForearmLY, armLambda);
             }
             if (heroRig.forearmR) {
               heroRig.forearmR.rotation.x = dampJoint(heroRig.forearmR.rotation.x, targetForearmRX, armLambda);
@@ -5534,6 +6761,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
 
           if (inp.attackQueued) {
             inp.attackQueued = false;
+            shieldGuardTimer = 0;
             if (heldDefNow?.toolKind === 'fishingPole') {
               triggerFishingAction();
             } else if (attackAnimTimer <= 0.06) {
@@ -5781,12 +7009,39 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 // Direct melee impact!
                 attackHitEnemies.add(rt.id);
                 wearHeldDurability(2);
-                rt.health -= heroAttackDamage;
+                const targetDesc: EnemyTargetDescriptors = {
+                  isBoss: rt.isBoss,
+                  isFlying: Boolean(rt.quadrupedRig?.canFly || rt.baddieRig?.isFlyer || rt.flightY > 0.35),
+                  isBeast: Boolean(rt.quadrupedRig),
+                  isElemental:
+                    rt.monsterAbility === 'flameBody' ||
+                    rt.monsterAbility === 'staticShell' ||
+                    Boolean(
+                      rt.baddieAI &&
+                        [
+                          rt.baddieAI.primaryAction,
+                          rt.baddieAI.secondaryAction,
+                        ].some((act) =>
+                          ['fireBreath', 'iceBreath', 'electricShock', 'poisonSpit', 'waterJet', 'shadowBeam', 'solarBeam'].includes(
+                            act
+                          )
+                        )
+                    ),
+                  isHeavyBrute: rt.maxHealth >= 8 || rt.monsterAbility === 'thickFat',
+                };
+                const meleeOut = computeHeroOutgoingDamage(heroAttackDamage, heroProfile, targetDesc);
+                rt.health -= meleeOut.damage;
                 AudioEngine.playSound(activeLevel.audio.hit);
+                if (meleeOut.matchupNote && rt.health > 0) {
+                  showToast(`${meleeOut.matchupNote} (${meleeOut.damage} DMG)`);
+                }
 
                 // Physical bump-back impulse, upward hop, hit-flash & stagger recoil
+                const powerStrikeBonus = heroSkillSet.has('powerStrike') ? 1.25 : 1;
                 const knockSpeed =
-                  (rt.isBoss ? 7.6 : 12.6) * (rt.monsterAbility === 'thickFat' ? 0.55 : 1);
+                  (rt.isBoss ? 7.6 : 12.6) *
+                  powerStrikeBonus *
+                  (rt.monsterAbility === 'thickFat' ? 0.55 : 1);
                 rt.vx = nx * knockSpeed;
                 rt.vz = nz * knockSpeed;
                 rt.vy = (rt.isBoss ? 2.6 : 4.3) * (rt.monsterAbility === 'thickFat' ? 0.65 : 1);
@@ -5829,31 +7084,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 const sparkZ = heroZ + dz * 0.68;
 
                 if (rt.health <= 0) {
-                  rt.aiState = 'dying';
-                  rt.stateTimer = 0.52;
-                  rt.vx = nx * 13.8;
-                  rt.vz = nz * 13.8;
-                  rt.vy = 5.6;
-                  rt.defeatSpin = (Math.random() > 0.5 ? 1 : -1) * 9.0;
-                  hitStopTimer = 0.055;
-                  shakeTimer = Math.max(shakeTimer, 0.2);
-                  spawnCombatSparks(sparkX, impactY, sparkZ, '#FFD166', 12, 8.2);
-                  coins += rt.isBoss ? 10 : 2;
-                  recordRoguelikeEnemyKill(rt);
-                  if (rt.pickupable && rt.pickupItemId) {
-                    const gy = sampleLevelHeight(activeLevel, rt.x, rt.z);
-                    spawnDroppedItem(
-                      rt.pickupItemId,
-                      rt.pickupQty,
-                      rt.x,
-                      gy + 0.5,
-                      rt.z,
-                      nx * 2.5,
-                      4.6,
-                      nz * 2.5
-                    );
-                  }
-                  showToast(`Defeated ${rt.name}!`);
+                  beginBaddieDeath(rt, nx, nz);
                 } else {
                   hitStopTimer = 0.042;
                   shakeTimer = Math.max(shakeTimer, 0.14);
@@ -6419,12 +7650,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   rt.recoilPitch = -0.45;
                   spawnCombatSparks(q.mesh.position.x, q.mesh.position.y, q.mesh.position.z, '#F59E0B', 7, 6.2);
                   if (rt.health <= 0) {
-                    rt.aiState = 'dying';
-                    rt.stateTimer = 0.5;
-                    rt.defeatSpin = 8.5;
-                    coins += rt.isBoss ? 10 : 3;
-                    recordRoguelikeEnemyKill(rt);
-                    showToast(`Defeated ${rt.name}!`);
+                    beginBaddieDeath(rt, q.vx / ql, q.vz / ql);
                   } else {
                     rt.aiState = 'stagger';
                     rt.stateTimer = 0.45;
@@ -6590,7 +7816,32 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               if (!rt.alive || rt.kind !== 'baddie' || rt.aiState === 'dying') continue;
               if (Math.hypot(rt.x - b.mesh.position.x, rt.z - b.mesh.position.z) < 1.25) {
                 hit = true;
-                rt.health -= 2 + (relicMods?.magicBoltBonus ?? 0);
+                const boltTargetDesc: EnemyTargetDescriptors = {
+                  isBoss: rt.isBoss,
+                  isFlying: Boolean(rt.quadrupedRig?.canFly || rt.baddieRig?.isFlyer || rt.flightY > 0.35),
+                  isBeast: Boolean(rt.quadrupedRig),
+                  isElemental:
+                    rt.monsterAbility === 'flameBody' ||
+                    rt.monsterAbility === 'staticShell' ||
+                    Boolean(
+                      rt.baddieAI &&
+                        [
+                          rt.baddieAI.primaryAction,
+                          rt.baddieAI.secondaryAction,
+                        ].some((act) =>
+                          ['fireBreath', 'iceBreath', 'electricShock', 'poisonSpit', 'waterJet', 'shadowBeam', 'solarBeam'].includes(
+                            act
+                          )
+                        )
+                    ),
+                  isHeavyBrute: rt.maxHealth >= 8 || rt.monsterAbility === 'thickFat',
+                };
+                const boltOut = computeHeroOutgoingDamage(
+                  heroProfile.stats.magicPower + (relicMods?.magicBoltBonus ?? 0),
+                  heroProfile,
+                  boltTargetDesc
+                );
+                rt.health -= boltOut.damage;
                 AudioEngine.playSound(activeLevel.audio.hit);
                 const bLen = Math.max(0.1, Math.hypot(b.vx, b.vz));
                 const bnx = b.vx / bLen;
@@ -6602,12 +7853,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 rt.recoilPitch = -0.58;
                 spawnCombatSparks(b.mesh.position.x, b.mesh.position.y, b.mesh.position.z, '#7CCBFF', 9, 7.2);
                 if (rt.health <= 0) {
-                  rt.aiState = 'dying';
-                  rt.stateTimer = 0.5;
-                  rt.defeatSpin = 8.5;
-                  coins += rt.isBoss ? 10 : 3;
-                  recordRoguelikeEnemyKill(rt);
-                  showToast(`Defeated ${rt.name}!`);
+                  beginBaddieDeath(rt, bnx, bnz);
                 } else {
                   rt.aiState = 'stagger';
                   rt.stateTimer = 0.4;
@@ -6653,6 +7899,14 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           const baddiesRemaining = runtimeEntities.some((r) => r.kind === 'baddie' && r.alive);
           let nearestDoorPrompt: { label: string; isOpen: boolean; locked: boolean } | null = null;
           let nearestDoorPromptDist = 999;
+          let nearestChestPrompt: {
+            label: string;
+            isOpen: boolean;
+            locked: boolean;
+            lockedMessage?: string;
+            itemCount: number;
+          } | null = null;
+          let nearestChestPromptDist = 999;
           let nearInteractableEntity = false;
 
           for (const rt of runtimeEntities) {
@@ -6661,6 +7915,43 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             const prevRtX = rt.x;
             const prevRtZ = rt.z;
             rt.mechController?.update(dt);
+            if (rt.kind === 'treasure') {
+              if (rt.chestAnim) {
+                const mechProg =
+                  rt.mechController && rt.mechanisms.length > 0
+                    ? rt.mechController.getProgress(rt.mechanisms[0].id)
+                    : undefined;
+                const finishedAnim = updateTreasureChestRig(
+                  rt.chestAnim,
+                  dt,
+                  gameElapsed,
+                  rt.chestLootEntries.length > 0,
+                  mechProg
+                );
+                if (finishedAnim && rt.chestOpening) {
+                  rt.chestOpening = false;
+                  rt.opened = true;
+                  if (openingChestId === rt.id) {
+                    openingChestId = null;
+                  }
+                  chestOpeningLockRef.current = false;
+                  setIsChestOpeningAnim(false);
+                  openChestModalFnRef.current(rt.id, rt.name);
+                }
+              } else if (rt.chestOpening) {
+                rt.chestOpenTimer -= dt;
+                if (rt.chestOpenTimer <= 0) {
+                  rt.chestOpening = false;
+                  rt.opened = true;
+                  if (openingChestId === rt.id) {
+                    openingChestId = null;
+                  }
+                  chestOpeningLockRef.current = false;
+                  setIsChestOpeningAnim(false);
+                  openChestModalFnRef.current(rt.id, rt.name);
+                }
+              }
+            }
             for (let fi = 0; fi < rt.floatSpinMeshes.length; fi++) {
               rt.floatSpinMeshes[fi].rotation.y += dt * 1.8;
             }
@@ -6698,6 +7989,116 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 interactConsumed = true;
               }
               rt.fxRuntime.update(dt, camera);
+              continue;
+            }
+
+            // Treasure chest: sit in world, prompt to press Use, animate spring-open + gold glow first, then open ChestLootModal
+            if (rt.kind === 'treasure') {
+              const useRadius =
+                rt.mechanisms.length > 0
+                  ? Math.max(
+                      2.35,
+                      rt.mechanisms[0]?.triggers.find((t) => t.event === 'playerUses')?.radius ?? 2.35
+                    )
+                  : 2.35;
+
+              if (
+                !rt.chestOpening &&
+                (!rt.opened || rt.chestLootEntries.length > 0) &&
+                dist < useRadius &&
+                vertOk
+              ) {
+                nearInteractableEntity = true;
+                let isLocked = false;
+                let lockedMsg = '';
+                let blockingRule: {
+                  mechId: string;
+                  rule: ObjectMechanism['triggers'][number];
+                } | null = null;
+
+                if (rt.mechanisms.length > 0 && !rt.opened) {
+                  for (const mech of rt.mechanisms) {
+                    const useRule = mech.triggers.find((t) => t.event === 'playerUses');
+                    if (!useRule) continue;
+                    blockingRule = { mechId: mech.id, rule: useRule };
+                    let condPassed = true;
+                    if (useRule.condition === 'hasKey') condPassed = keys > 0;
+                    else if (useRule.condition === 'hasItem') {
+                      const reqId = useRule.conditionValue;
+                      condPassed = Boolean(
+                        reqId &&
+                          inventoryStacksRef.current.some((s) => s.itemId === reqId && s.qty > 0)
+                      );
+                    } else if (useRule.condition === 'flagSet') {
+                      const reqFlag = useRule.conditionValue?.trim();
+                      condPassed = Boolean(reqFlag && gameFlags.has(reqFlag));
+                    } else if (useRule.condition === 'baddiesGone') {
+                      condPassed = !baddiesRemaining;
+                    }
+                    if (!condPassed) {
+                      isLocked = true;
+                      lockedMsg = useRule.lockedMessage?.trim() || `${rt.name} is locked!`;
+                    }
+                    break;
+                  }
+                }
+
+                if (dist < nearestChestPromptDist) {
+                  nearestChestPromptDist = dist;
+                  nearestChestPrompt = {
+                    label: rt.name,
+                    isOpen: rt.opened,
+                    locked: isLocked,
+                    lockedMessage: lockedMsg || undefined,
+                    itemCount: rt.chestLootEntries.length,
+                  };
+                }
+
+                if (didInteract && !interactConsumed && !openingChestId) {
+                  interactConsumed = true;
+                  if (isLocked) {
+                    showToast(lockedMsg || `${rt.name} is locked!`);
+                  } else if (!rt.opened) {
+                    if (blockingRule && rt.mechController) {
+                      const { mechId, rule } = blockingRule;
+                      if (rule.consumeRequired) {
+                        if (rule.condition === 'hasKey' && keys > 0) keys -= 1;
+                        if (rule.condition === 'hasItem' && rule.conditionValue) {
+                          removeItemFromBag(rule.conditionValue, 1);
+                        }
+                      }
+                      if (rule.setFlagOnOpen?.trim()) {
+                        gameFlags.add(rule.setFlagOnOpen.trim());
+                      }
+                      rt.mechController.trigger(mechId, 'open');
+                    }
+
+                    rt.chestOpening = true;
+                    openingChestId = rt.id;
+                    chestOpeningLockRef.current = true;
+                    setIsChestOpeningAnim(true);
+                    if (rt.chestAnim) {
+                      rt.chestAnim.opening = true;
+                      rt.chestAnim.openElapsed = 0;
+                      rt.chestAnim.openProgress = 0;
+                    } else {
+                      rt.chestOpenTimer = 0.95;
+                    }
+                    AudioEngine.playSound(activeLevel.audio.door);
+                    AudioEngine.playSound('sparkle');
+                    spawnCombatSparks(
+                      rt.x,
+                      rtBaseY + 0.65,
+                      rt.z,
+                      '#FFD24C',
+                      16,
+                      5.4
+                    );
+                  } else if (rt.chestLootEntries.length > 0) {
+                    openChestModalFnRef.current(rt.id, rt.name);
+                  }
+                }
+              }
               continue;
             }
 
@@ -6841,25 +8242,6 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               }
               AudioEngine.playSound(activeLevel.audio.coin);
               showToast(`Picked up ${rt.name}!`);
-            } else if (rt.kind === 'treasure' && !rt.opened && dist < 1.5 && vertOk) {
-              rt.opened = true;
-              rt.alive = false;
-              rt.mesh.visible = false;
-              coins += 3;
-              AudioEngine.playSound(activeLevel.audio.coin);
-              if (rt.pickupable && rt.pickupItemId) {
-                const itemDef = itemByIdRef.current.get(rt.pickupItemId);
-                addItemToBag(
-                  rt.pickupItemId,
-                  rt.pickupQty,
-                  itemDef?.category === 'tool' || itemDef?.category === 'weapon'
-                );
-                showToast(
-                  `Opened ${rt.name}: +3 coins & ${itemDef?.name ?? 'Item'}!`
-                );
-              } else {
-                showToast(`Opened ${rt.name}: +3 coins!`);
-              }
             } else if (rt.buildingBlock?.shape === 'trapdoor') {
               if (dist < 2.25 && vertOk) {
                 if (dist < nearestDoorPromptDist) {
@@ -7537,6 +8919,15 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               rt.recoilPitch = THREE.MathUtils.damp(rt.recoilPitch, 0, 9.5, dt);
               rt.recoilRoll = THREE.MathUtils.damp(rt.recoilRoll, 0, 9.5, dt);
 
+              const aiCfg =
+                rt.baddieAI ??
+                resolveBaddieAIConfig({
+                  name: rt.name,
+                  brain: rt.brain,
+                  isBoss: rt.isBoss,
+                });
+              const canFly = Boolean(rt.quadrupedRig?.canFly || rt.baddieRig?.isFlyer);
+
               // Apply physical knockback/lunge velocity and vertical hop gravity
               if (Math.abs(rt.vx) > 0.03 || Math.abs(rt.vz) > 0.03) {
                 const [kx, kz] = resolveHorizontalCollision(
@@ -7579,7 +8970,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   rt.health = Math.min(rt.maxHealth, rt.health + 1);
                   spawnCombatSparks(
                     rt.x,
-                    sampleLevelHeight(activeLevel, rt.x, rt.z) + 1.0,
+                    sampleLevelHeight(activeLevel, rt.x, rt.z) + rt.flightY + 1.0,
                     rt.z,
                     '#4ADE80',
                     5,
@@ -7588,36 +8979,176 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 }
               }
 
-              const curAttack = rt.activeAttack ?? 'clawSlash';
-              const attackMeta = MONSTER_ATTACK_BY_ID[curAttack] ?? MONSTER_ATTACK_BY_ID.clawSlash;
-              const berserkActive =
-                rt.monsterAbility === 'berserk' && rt.health <= Math.max(1, rt.maxHealth * 0.5);
-              const hasCustomMove = Boolean(rt.quadrupedRig && rt.monsterPrimaryAttack);
-              const windupTotal = hasCustomMove
-                ? attackMeta.windupDuration
-                : rt.isBoss
-                ? 0.58
-                : 0.46;
-              const strikeTotal = hasCustomMove ? attackMeta.strikeDuration : 0.24;
+              // Spatial + Sight-Cone detection check
+              const dxToHero = heroX - rt.x;
+              const dzToHero = heroZ - rt.z;
+              const invDist = dist > 0.01 ? 1 / dist : 0;
+              const faceX = Math.sin(rt.mesh.rotation.y);
+              const faceZ = Math.cos(rt.mesh.rotation.y);
+              const sightDot = dist > 0.01 ? (dxToHero * invDist) * faceX + (dzToHero * invDist) * faceZ : 1;
+              const sightCos = Math.cos((((aiCfg.sightAngleDeg ?? 120) * 0.5) * Math.PI) / 180);
+              const aggroRange = aiCfg.aggroRange;
+              const inSpatial = dist <= aggroRange;
+              const inSight = dist <= aggroRange * 1.22 && sightDot >= sightCos;
+              const damagedAggro = rt.health < rt.maxHealth && dist <= aggroRange * 1.35;
+              const heroDetected =
+                aiCfg.detectionMode === 'spatial'
+                  ? inSpatial || damagedAggro
+                  : aiCfg.detectionMode === 'sight'
+                  ? inSight || damagedAggro
+                  : inSpatial || inSight || damagedAggro;
 
-              const aggroRange = rt.isBoss ? 12.5 : 9.2;
-              const attackReach = hasCustomMove
-                ? Math.max(
-                    rt.isBoss ? 2.75 : 2.2,
-                    Math.min(rt.monsterAttackRange ?? attackMeta.defaultRange, attackMeta.defaultRange + 0.7)
-                  )
-                : rt.isBoss
-                ? 2.75
-                : 2.2;
+              // Evaluate Baddie Logic BehaviorCards (seesPlayer, playerNear, isFlying, isGrounded, flyPattern, randomAttack, landAndAttack, enrage, attack)
+              if (rt.aiState !== 'dying' && rt.cards.length > 0) {
+                for (const card of rt.cards) {
+                  if (!card.isEnabled) continue;
+                  const trig = card.when;
+                  let trigOk = false;
+                  if (trig.key === 'seesPlayer') {
+                    const customRange = Number(trig.detail);
+                    trigOk =
+                      Number.isFinite(customRange) && customRange > 0
+                        ? dist <= customRange
+                        : heroDetected;
+                  } else if (trig.key === 'playerNear') {
+                    const customRange = Number(trig.detail);
+                    trigOk = dist <= (Number.isFinite(customRange) && customRange > 0 ? customRange : 6.5);
+                  } else if (trig.key === 'takesDamage') {
+                    trigOk = rt.hitFlashTimer > 0.14;
+                  } else if (trig.key === 'healthLow') {
+                    trigOk = rt.health <= Math.max(1, Math.ceil(rt.maxHealth * 0.5));
+                  } else if (trig.key === 'timer') {
+                    const sec = Math.max(2, Number(trig.detail) || 5);
+                    trigOk = Math.floor(gameElapsed * 10) % (sec * 10) === 0;
+                  } else if (trig.key === 'gameStart') {
+                    trigOk = gameElapsed < 0.12;
+                  }
+                  if (!trigOk) continue;
+
+                  let condsOk = true;
+                  for (const cond of card.conditions) {
+                    if (cond.key === 'isFlying' && !(canFly && rt.flightY > 0.45)) {
+                      condsOk = false;
+                      break;
+                    }
+                    if (cond.key === 'isGrounded' && canFly && rt.flightY > 0.45) {
+                      condsOk = false;
+                      break;
+                    }
+                    if (cond.key === 'isBoss' && !rt.isBoss) {
+                      condsOk = false;
+                      break;
+                    }
+                    if (cond.key === 'playerClose' && dist > 6.5) {
+                      condsOk = false;
+                      break;
+                    }
+                    if (cond.key === 'flagSet' && (!cond.detail || !gameFlags.has(cond.detail))) {
+                      condsOk = false;
+                      break;
+                    }
+                    if (cond.key === 'hasKey' && keys <= 0) {
+                      condsOk = false;
+                      break;
+                    }
+                    if (cond.key === 'healthHalf' && rt.health > Math.ceil(rt.maxHealth * 0.5)) {
+                      condsOk = false;
+                      break;
+                    }
+                  }
+                  if (!condsOk) continue;
+
+                  for (const act of card.actions) {
+                    if (act.key === 'chase') {
+                      rt.behaviorChaseOrdered = true;
+                      rt.behaviorFleeOrdered = false;
+                    } else if (act.key === 'flee') {
+                      rt.behaviorFleeOrdered = true;
+                      rt.behaviorChaseOrdered = false;
+                    } else if (act.key === 'patrol') {
+                      rt.behaviorChaseOrdered = false;
+                      rt.behaviorFleeOrdered = false;
+                    } else if (act.key === 'flyPattern' && act.detail) {
+                      const dLow = act.detail.trim().toLowerCase();
+                      if (
+                        dLow === 'circle' ||
+                        dLow === 'figure8' ||
+                        dLow === 'swoop' ||
+                        dLow === 'hover'
+                      ) {
+                        aiCfg.flightPattern = dLow;
+                      }
+                    } else if (act.key === 'attack') {
+                      if (
+                        rt.attackCooldown <= 0 &&
+                        (rt.aiState === 'patrol' || rt.aiState === 'chase') &&
+                        !rt.behaviorAttackQueue
+                      ) {
+                        const resolved = resolveBaddieActionId(act.detail);
+                        rt.behaviorAttackQueue = resolved ?? aiCfg.primaryAction;
+                      }
+                    } else if (act.key === 'randomAttack') {
+                      if (
+                        rt.attackCooldown <= 0 &&
+                        (rt.aiState === 'patrol' || rt.aiState === 'chase') &&
+                        !rt.behaviorAttackQueue
+                      ) {
+                        rt.behaviorAttackQueue = pickNextBaddieAction(
+                          aiCfg,
+                          rt.activeAttack,
+                          dist,
+                          canFly && rt.flightY > 0.35,
+                          canFly
+                        );
+                      }
+                    } else if (act.key === 'landAndAttack') {
+                      if (
+                        rt.attackCooldown <= 0 &&
+                        (rt.aiState === 'patrol' || rt.aiState === 'chase') &&
+                        !rt.behaviorAttackQueue
+                      ) {
+                        const resolved = resolveBaddieActionId(act.detail);
+                        rt.behaviorAttackQueue = resolved ?? 'groundPound';
+                      }
+                    } else if (act.key === 'enrage') {
+                      if (!rt.enraged) {
+                        rt.enraged = true;
+                        showToast(`${rt.name} erupts with fury!`);
+                      }
+                    }
+                  }
+                }
+              }
+
+              let curAttack = rt.activeAttack ?? aiCfg.primaryAction ?? 'clawSlash';
+              let actionDef = BADDIE_ACTION_BY_ID[curAttack] ?? BADDIE_ACTION_BY_ID.clawSlash;
+              const berserkActive =
+                rt.enraged ||
+                (rt.monsterAbility === 'berserk' && rt.health <= Math.max(1, rt.maxHealth * 0.5));
+              const windupTotal = actionDef.windupDuration;
+              const strikeTotal = actionDef.strikeDuration;
+
+              const attackReach =
+                actionDef.category === 'smash' || actionDef.category === 'melee'
+                  ? actionDef.defaultRange
+                  : Math.max(actionDef.defaultRange, rt.monsterAttackRange ?? actionDef.defaultRange);
               const bSpeed = Math.max(1.8, rt.speed * 0.95 * (berserkActive ? 1.26 : 1));
               let movingBaddie = false;
 
               if (rt.aiState === 'dying') {
                 rt.stateTimer -= dt;
-                rt.mesh.rotation.y += rt.defeatSpin * dt;
-                const dyingScale = THREE.MathUtils.clamp(rt.stateTimer / 0.24, 0.01, 1);
-                rt.mesh.scale.setScalar(dyingScale);
+                if (canFly && rt.flightY > 0) {
+                  rt.flightY = Math.max(0, rt.flightY - dt * 7.2);
+                }
+                if (rt.defeatSpin !== 0) {
+                  rt.mesh.rotation.y += rt.defeatSpin * dt;
+                }
+                if (rt.baddieRig && !rt.quadrupedRig) {
+                  const dyingScale = THREE.MathUtils.clamp(rt.stateTimer / 0.3, 0.01, 1);
+                  rt.mesh.scale.setScalar(dyingScale);
+                }
                 if (rt.stateTimer <= 0) {
+                  rt.deathFinalized = true;
                   rt.alive = false;
                   rt.mesh.visible = false;
                   if (rt.hpBar) {
@@ -7629,7 +9160,25 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               } else if (rt.aiState === 'stagger') {
                 rt.stateTimer -= simDt;
                 if (rt.stateTimer <= 0) {
-                  rt.aiState = dist < aggroRange ? 'chase' : 'patrol';
+                  rt.aiState = heroDetected ? 'chase' : 'patrol';
+                }
+              } else if (rt.aiState === 'landing') {
+                rt.stateTimer -= simDt;
+                rt.targetFlightY = 0;
+                rt.flightY = Math.max(0, rt.flightY - dt * 6.8);
+                if (dist > 0.1) {
+                  rt.mesh.rotation.y = Math.atan2(dxToHero * invDist, dzToHero * invDist);
+                }
+                if (rt.flightY <= 0.14 || rt.stateTimer <= 0) {
+                  rt.flightY = 0;
+                  rt.aiState = 'windup';
+                  rt.stateTimer = windupTotal;
+                  rt.attackDirX = dist > 0.1 ? dxToHero * invDist : Math.sin(rt.mesh.rotation.y);
+                  rt.attackDirZ = dist > 0.1 ? dzToHero * invDist : Math.cos(rt.mesh.rotation.y);
+                  rt.lockedTargetX = heroX;
+                  rt.lockedTargetZ = heroZ;
+                  rt.strikeDidHit = false;
+                  heroEffects.emitKnockdownImpact(rt.x, sampleLevelHeight(activeLevel, rt.x, rt.z), rt.z);
                 }
               } else if (rt.aiState === 'windup') {
                 rt.stateTimer -= simDt;
@@ -7641,12 +9190,23 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 if (rt.quadrupedRig) {
                   monsterVfx.emitAttackStep(rt.quadrupedRig, curAttack, 'windup', windupProg, simDt);
                 }
-                // Track hero during first half of windup, then lock direction so player can dodge
-                if (rt.stateTimer > windupTotal * 0.42 && dist > 0.1) {
-                  rt.attackDirX = (heroX - rt.x) / dist;
-                  rt.attackDirZ = (heroZ - rt.z) / dist;
+                // Brief aim settle in first 15% of windup, then STRICT lock-on so hero can sidestep or dodge!
+                if (rt.stateTimer > windupTotal * 0.85 && dist > 0.1) {
+                  rt.attackDirX = dxToHero * invDist;
+                  rt.attackDirZ = dzToHero * invDist;
+                  rt.lockedTargetX = heroX;
+                  rt.lockedTargetZ = heroZ;
                   rt.mesh.rotation.y = Math.atan2(rt.attackDirX, rt.attackDirZ);
                 }
+                const lockGroundY = sampleLevelHeight(activeLevel, rt.lockedTargetX, rt.lockedTargetZ);
+                monsterVfx.emitLockedTelegraph(
+                  rt.lockedTargetX,
+                  lockGroundY,
+                  rt.lockedTargetZ,
+                  actionDef.coneHalfAngleCos <= -0.9 ? actionDef.aoeRadius : Math.min(3.0, actionDef.aoeRadius),
+                  actionDef.telegraphColor,
+                  windupProg
+                );
                 if (rt.stateTimer <= 0) {
                   rt.aiState = 'strike';
                   rt.stateTimer = strikeTotal;
@@ -7654,20 +9214,21 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   const lungeMult =
                     curAttack === 'chargeGore'
                       ? 1.45
-                      : attackMeta.isRangedBreath || attackMeta.isRadialAoe
-                      ? 0.18
-                      : 1.0;
-                  const lungeSpeed = (rt.isBoss ? 9.2 : 8.4) * lungeMult;
+                      : actionDef.category === 'breath' || actionDef.category === 'spell' || actionDef.category === 'smash'
+                      ? 0.16
+                      : 0.95;
+                  const lungeSpeed = (rt.isBoss ? 8.8 : 8.0) * lungeMult;
                   rt.vx += rt.attackDirX * lungeSpeed;
                   rt.vz += rt.attackDirZ * lungeSpeed;
-                  if (rt.baddieRig?.isFlyer || rt.quadrupedRig?.canFly) {
-                    rt.vy = -1.2;
-                  }
-                  if (attackMeta.element === 'Water') {
+                  if (actionDef.id === 'waterJet') {
                     AudioEngine.playSound('splash');
-                  } else if (attackMeta.element === 'Electric' || attackMeta.element === 'Solar' || attackMeta.element === 'Ice') {
+                  } else if (
+                    actionDef.id === 'electricShock' ||
+                    actionDef.id === 'solarBeam' ||
+                    actionDef.id === 'iceBreath'
+                  ) {
                     AudioEngine.playSound('sparkle');
-                  } else if (attackMeta.element === 'Sound') {
+                  } else if (actionDef.id === 'sonicRoar' || actionDef.id === 'groundPound') {
                     AudioEngine.playSound('hit');
                   } else {
                     AudioEngine.playSound('whoosh');
@@ -7684,40 +9245,93 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 if (rt.quadrupedRig) {
                   monsterVfx.emitAttackStep(rt.quadrupedRig, curAttack, 'strike', strikeProg, simDt);
                 }
-                // Active enemy strike frames
+                // Active enemy strike frames against the LOCKED heading / target zone (fully dodgeable!)
                 if (
                   !rt.strikeDidHit &&
                   strikeProg >= 0.16 &&
-                  strikeProg <= 0.86 &&
+                  strikeProg <= 0.88 &&
                   hitInvuln <= 0
                 ) {
                   const curDx = heroX - rt.x;
                   const curDz = heroZ - rt.z;
                   const curDist = Math.hypot(curDx, curDz);
-                  const hitReach = hasCustomMove
-                    ? attackReach * 1.04
-                    : rt.isBoss
-                    ? 2.55
-                    : 2.0;
                   const dot =
                     curDist > 0.01
                       ? (curDx / curDist) * rt.attackDirX + (curDz / curDist) * rt.attackDirZ
                       : 1;
                   const ryCheck = sampleLevelHeight(activeLevel, rt.x, rt.z) + (rt.elevationY ?? 0);
-                  const verticalLimit = attackMeta.isRangedBreath || attackMeta.isRadialAoe ? 2.25 : 1.75;
-                  const dirHitOk = attackMeta.isRadialAoe
-                    ? true
-                    : attackMeta.isRangedBreath
-                    ? dot > 0.52 || curDist < 1.35
-                    : dot > 0.12 || curDist < 1.15;
-                  if (curDist < hitReach && dirHitOk && Math.abs(heroY - ryCheck) < verticalLimit) {
+                  const verticalLimit =
+                    actionDef.category === 'breath' ||
+                    actionDef.category === 'spell' ||
+                    actionDef.category === 'smash' ||
+                    actionDef.category === 'roar'
+                      ? 3.2
+                      : 2.1;
+
+                  let didStrikeConnect = false;
+                  if (actionDef.coneHalfAngleCos <= -0.9) {
+                    const distToLock = Math.hypot(heroX - rt.lockedTargetX, heroZ - rt.lockedTargetZ);
+                    didStrikeConnect =
+                      curDist <= actionDef.aoeRadius || distToLock <= actionDef.aoeRadius * 0.88;
+                  } else {
+                    const hitReach = Math.max(attackReach, actionDef.defaultRange);
+                    didStrikeConnect =
+                      curDist <= hitReach &&
+                      (dot >= actionDef.coneHalfAngleCos || curDist < 1.15);
+                  }
+
+                  if (didStrikeConnect && Math.abs(heroY - ryCheck) < verticalLimit) {
                     rt.strikeDidHit = true;
-                    let incomingDmg = Math.max(
+                    const rawHitDmg = Math.max(
                       1,
-                      Math.round((rt.monsterAttackPower ?? 1) * (berserkActive ? 1.5 : 1))
+                      Math.round((rt.monsterAttackPower ?? actionDef.directDamage) * (berserkActive ? 1.35 : 1))
                     );
-                    if (heroDefensePower > 0) {
-                      armorBlockCounter += heroDefensePower;
+                    const baddieDesc: EnemyTargetDescriptors = {
+                      isBoss: rt.isBoss,
+                      isFlying: Boolean(rt.quadrupedRig?.canFly || rt.baddieRig?.isFlyer || rt.flightY > 0.35),
+                      isBeast: Boolean(rt.quadrupedRig),
+                      isElemental:
+                        actionDef.heroEffect === 'burn' ||
+                        actionDef.heroEffect === 'freeze' ||
+                        actionDef.heroEffect === 'shock' ||
+                        actionDef.heroEffect === 'poison' ||
+                        actionDef.heroEffect === 'soak',
+                      isHeavyBrute: rt.maxHealth >= 8 || actionDef.heroEffect === 'knockdown',
+                    };
+                    const incomingCalc = computeHeroIncomingDamage(
+                      rawHitDmg,
+                      effectiveHeroDefense,
+                      heroProfile,
+                      actionDef,
+                      baddieDesc
+                    );
+                    let incomingDmg = incomingCalc.damage;
+                    const shieldedBlock = Boolean(isShieldBlockingNow && activeOffhandDefNow);
+                    if (shieldedBlock) {
+                      const blockRed = THREE.MathUtils.clamp(
+                        activeOffhandDefNow?.blockReduction ?? 0.65,
+                        0.25,
+                        0.92
+                      );
+                      const preBlockDmg = incomingDmg;
+                      incomingDmg = Math.max(0, Math.round(preBlockDmg * (1 - blockRed)));
+                      const blockedAmount = Math.max(1, preBlockDmg - incomingDmg);
+                      spawnCombatSparks(
+                        heroX + Math.sin(heroYaw) * 0.52,
+                        heroY + 1.15,
+                        heroZ + Math.cos(heroYaw) * 0.52,
+                        '#60A5FA',
+                        12,
+                        6.4
+                      );
+                      wearShieldDurability(2);
+                      showToast(
+                        incomingDmg === 0
+                          ? `Shield blocked ${rt.name}'s attack!`
+                          : `Shield blocked! (-${blockedAmount} dmg)`
+                      );
+                    } else if (effectiveHeroDefense > 0) {
+                      armorBlockCounter += effectiveHeroDefense;
                       if (armorBlockCounter >= 3) {
                         armorBlockCounter -= 3;
                         incomingDmg = 0;
@@ -7727,23 +9341,56 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                     }
                     if (incomingDmg > 0) {
                       health -= incomingDmg;
+                      if (incomingCalc.note && !shieldedBlock) {
+                        showToast(incomingCalc.note);
+                      }
                     }
-                    hitInvuln = 0.95;
-                    shakeTimer = incomingDmg > 0 ? 0.26 : 0.1;
-                    hitStopTimer = 0.036;
-                    const kbDirX = attackMeta.isRadialAoe && curDist > 0.05 ? curDx / curDist : rt.attackDirX;
-                    const kbDirZ = attackMeta.isRadialAoe && curDist > 0.05 ? curDz / curDist : rt.attackDirZ;
-                    heroKnockVX = kbDirX * (incomingDmg > 0 ? 9.8 : 5.2);
-                    heroKnockVZ = kbDirZ * (incomingDmg > 0 ? 9.8 : 5.2);
-                    if (!isSwimming && heroY <= floorY + 0.22 && incomingDmg > 0) {
-                      heroVelY = 3.6;
+                    const invulnScale =
+                      heroProfile.stats.dodgeInvulnMult * (heroSkillSet.has('glassCannon') ? 0.75 : 1);
+                    hitInvuln = 0.95 * invulnScale;
+                    shakeTimer = shieldedBlock ? 0.11 : incomingDmg > 0 ? 0.28 : 0.1;
+                    hitStopTimer = 0.04;
+                    const kbDirX =
+                      actionDef.coneHalfAngleCos <= -0.9 && curDist > 0.05
+                        ? curDx / curDist
+                        : rt.attackDirX;
+                    const kbDirZ =
+                      actionDef.coneHalfAngleCos <= -0.9 && curDist > 0.05
+                        ? curDz / curDist
+                        : rt.attackDirZ;
+                    const kbMag = shieldedBlock
+                      ? actionDef.knockbackForce * 0.42
+                      : incomingDmg > 0
+                      ? actionDef.knockbackForce
+                      : 4.2;
+                    heroKnockVX = kbDirX * kbMag;
+                    heroKnockVZ = kbDirZ * kbMag;
+                    if (!shieldedBlock && !isSwimming && heroY <= floorY + 0.22 && incomingDmg > 0) {
+                      heroVelY = actionDef.heroEffect === 'knockdown' ? 3.2 : 2.6;
                     }
-                    heroRecoilTimer = incomingDmg > 0 ? 0.28 : 0.12;
-                    if (incomingDmg > 0) {
-                      spawnCombatSparks(heroX, heroY + 1.0, heroZ, attackMeta.color || '#FF6B4A', 8, 6.4);
+                    heroRecoilTimer = shieldedBlock ? 0.14 : incomingDmg > 0 ? 0.28 : 0.12;
+                    if (incomingDmg > 0 && !shieldedBlock) {
+                      spawnCombatSparks(
+                        heroX,
+                        heroY + 1.0,
+                        heroZ,
+                        actionDef.telegraphColor || '#FF6B4A',
+                        9,
+                        6.5
+                      );
                     }
-                    AudioEngine.playSound(incomingDmg > 0 ? 'hurt' : 'chime');
+                    AudioEngine.playSound(shieldedBlock || incomingDmg === 0 ? 'chime' : 'hurt');
                     AudioEngine.playSound('hit');
+
+                    applyBaddieAttackEffectToHero(
+                      actionDef,
+                      kbDirX,
+                      kbDirZ,
+                      incomingDmg === 0,
+                      incomingCalc.effectDurationMult,
+                      shieldedBlock
+                    );
+
                     if (
                       incomingDmg > 0 &&
                       isRoguelikeLevel &&
@@ -7755,19 +9402,14 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                       rt.hitFlashTimer = 0.16;
                       spawnCombatSparks(
                         rt.x,
-                        sampleLevelHeight(activeLevel, rt.x, rt.z) + 1.0,
+                        sampleLevelHeight(activeLevel, rt.x, rt.z) + rt.flightY + 1.0,
                         rt.z,
                         '#A855F7',
                         6,
                         5.5
                       );
                       if (rt.health <= 0) {
-                        rt.aiState = 'dying';
-                        rt.stateTimer = 0.5;
-                        rt.defeatSpin = 8.5;
-                        coins += rt.isBoss ? 10 : 2;
-                        recordRoguelikeEnemyKill(rt);
-                        showToast(`Briar Thorns felled ${rt.name}!`);
+                        beginBaddieDeath(rt, -kbDirX, -kbDirZ);
                       }
                     }
                     if (health <= 0) {
@@ -7777,26 +9419,61 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 }
                 if (rt.stateTimer <= 0) {
                   rt.aiState = 'recover';
-                  rt.stateTimer = rt.isBoss ? 0.44 : 0.54;
-                  const baseCd = rt.monsterAttackCooldown ?? (rt.isBoss ? 0.95 : 1.15);
+                  rt.stateTimer = actionDef.recoverDuration;
+                  const baseCd = rt.monsterAttackCooldown ?? (rt.isBoss ? 1.25 : 1.35);
+                  const varietySpan = 0.85 + Math.random() * (0.35 * (0.5 + aiCfg.varietyFactor));
                   const cdMult =
-                    (rt.monsterAbility === 'galeWings' && rt.quadrupedRig?.canFly ? 0.78 : 1) *
-                    (berserkActive ? 0.8 : 1);
+                    varietySpan *
+                    (rt.monsterAbility === 'galeWings' && canFly ? 0.8 : 1) *
+                    (berserkActive ? 0.78 : 1);
                   rt.attackCooldown = baseCd * cdMult;
-                  if (rt.monsterPrimaryAttack) {
-                    rt.attackCycleCount += 1;
-                    rt.activeAttack =
-                      rt.attackCycleCount % 3 === 2 && rt.monsterSecondaryAttack
-                        ? rt.monsterSecondaryAttack
-                        : rt.monsterPrimaryAttack;
+                  rt.attackCycleCount += 1;
+                  const enforceAirLand = canFly && aiCfg.landAfterAirAttack !== false;
+                  if (enforceAirLand && rt.flightY > 0.35) {
+                    rt.airAttacksSinceLand += 1;
+                    if (rt.airAttacksSinceLand >= 1) {
+                      rt.mustLandBeforeAttack = true;
+                      rt.postAirHoverTimer = 0.95 + Math.random() * 0.45;
+                    }
+                  }
+                  rt.activeAttack = pickNextBaddieAction(
+                    aiCfg,
+                    curAttack,
+                    dist,
+                    canFly && rt.flightY > 0.35,
+                    canFly
+                  );
+                  if (canFly) {
+                    rt.targetFlightY = rt.groundedHoldTimer > 0 ? 0 : aiCfg.hoverAttackHeight;
                   }
                 }
               } else if (rt.aiState === 'recover') {
                 rt.stateTimer -= simDt;
-                if (rt.stateTimer <= 0) {
-                  rt.aiState = dist < aggroRange ? 'chase' : 'patrol';
+                if (canFly) {
+                  rt.targetFlightY = rt.groundedHoldTimer > 0 ? 0 : aiCfg.hoverAttackHeight;
                 }
-              } else if (dist < aggroRange) {
+                if (rt.stateTimer <= 0) {
+                  // Recalibrate toward hero after attack concludes
+                  rt.aiState = heroDetected || rt.behaviorChaseOrdered ? 'chase' : 'patrol';
+                }
+              } else if (rt.behaviorFleeOrdered && dist < aggroRange * 1.1) {
+                const awayX = dist > 0.05 ? -dxToHero * invDist : 0;
+                const awayZ = dist > 0.05 ? -dzToHero * invDist : 1;
+                const [bx, bz] = resolveHorizontalCollision(
+                  activeLevel,
+                  rt.x + awayX * bSpeed * 1.1 * simDt,
+                  rt.z + awayZ * bSpeed * 1.1 * simDt,
+                  0.6,
+                  false,
+                  collisionCtx
+                );
+                rt.x = bx;
+                rt.z = bz;
+                rt.mesh.rotation.y = Math.atan2(awayX, awayZ);
+                movingBaddie = true;
+                rt.walkPhase += simDt * (bSpeed * 3.1);
+                if (canFly) rt.targetFlightY = aiCfg.flightAltitude;
+              } else if (heroDetected || rt.behaviorChaseOrdered) {
                 if (rt.aiState === 'patrol' && !rt.aggroShouted && rt.dialogueLines.length > 0) {
                   rt.aggroShouted = true;
                   pushCharacterSpeech(
@@ -7844,50 +9521,260 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   );
                 }
                 rt.aiState = 'chase';
-                const invD = 1 / Math.max(0.01, dist);
-                const dx = (heroX - rt.x) * invD;
-                const dz = (heroZ - rt.z) * invD;
+                const enforceAirLand = canFly && aiCfg.landAfterAirAttack !== false;
+                if (rt.groundedHoldTimer > 0) {
+                  rt.groundedHoldTimer = Math.max(0, rt.groundedHoldTimer - simDt);
+                }
+                if (canFly) {
+                  if (rt.mustLandBeforeAttack) {
+                    if (rt.postAirHoverTimer > 0) {
+                      rt.postAirHoverTimer = Math.max(0, rt.postAirHoverTimer - simDt);
+                      rt.targetFlightY = aiCfg.hoverAttackHeight;
+                    } else {
+                      rt.targetFlightY = 0;
+                      if (rt.flightY <= 0.25) {
+                        rt.flightY = 0;
+                        rt.mustLandBeforeAttack = false;
+                        rt.airAttacksSinceLand = 0;
+                        rt.groundedHoldTimer = 2.4 + Math.random() * 0.9;
+                      }
+                    }
+                  } else if (rt.groundedHoldTimer > 0) {
+                    rt.targetFlightY = 0;
+                  } else {
+                    rt.targetFlightY = aiCfg.hoverAttackHeight;
+                  }
+                }
+                const dx = dist > 0.01 ? dxToHero * invDist : Math.sin(rt.mesh.rotation.y);
+                const dz = dist > 0.01 ? dzToHero * invDist : Math.cos(rt.mesh.rotation.y);
                 rt.mesh.rotation.y = Math.atan2(dx, dz);
 
-                if (dist <= attackReach && rt.attackCooldown <= 0) {
-                  // Begin telegraphed attack windup!
-                  rt.aiState = 'windup';
-                  rt.stateTimer = windupTotal;
+                if (rt.behaviorAttackQueue) {
+                  curAttack = rt.behaviorAttackQueue;
+                  rt.activeAttack = curAttack;
+                  actionDef = BADDIE_ACTION_BY_ID[curAttack] ?? BADDIE_ACTION_BY_ID.clawSlash;
+                  rt.behaviorAttackQueue = null;
+                }
+
+                const wantReach =
+                  actionDef.category === 'smash' || actionDef.category === 'melee'
+                    ? actionDef.defaultRange
+                    : Math.max(actionDef.defaultRange, rt.monsterAttackRange ?? actionDef.defaultRange);
+
+                if (
+                  dist <= wantReach &&
+                  rt.attackCooldown <= 0 &&
+                  !(enforceAirLand && rt.mustLandBeforeAttack)
+                ) {
                   rt.attackDirX = dx;
                   rt.attackDirZ = dz;
+                  rt.lockedTargetX = heroX;
+                  rt.lockedTargetZ = heroZ;
                   rt.strikeDidHit = false;
-                } else if (dist > 1.35) {
-                  const [bx, bz] = resolveHorizontalCollision(
-                    activeLevel,
-                    rt.x + dx * bSpeed * simDt,
-                    rt.z + dz * bSpeed * simDt,
-                    0.6,
-                    false,
-                    collisionCtx
-                  );
-                  rt.x = bx;
-                  rt.z = bz;
-                  movingBaddie = true;
-                  rt.walkPhase += simDt * (bSpeed * 3.1);
+                  if (canFly && actionDef.flightMode === 'groundOnly' && rt.flightY > 0.35) {
+                    // Land smoothly before slamming the ground!
+                    rt.aiState = 'landing';
+                    rt.targetFlightY = 0;
+                    rt.stateTimer = 1.65;
+                  } else {
+                    rt.aiState = 'windup';
+                    rt.stateTimer = actionDef.windupDuration;
+                  }
+                } else if (enforceAirLand && rt.mustLandBeforeAttack) {
+                  // Flyer finished 1 air strike: hover around briefly then descend & land cleanly
+                  if (rt.postAirHoverTimer > 0) {
+                    rt.patrolAngle += simDt * 1.5;
+                    const strafeX = -dz * Math.cos(rt.patrolAngle * 0.65);
+                    const strafeZ = dx * Math.cos(rt.patrolAngle * 0.65);
+                    const [bx, bz] = resolveHorizontalCollision(
+                      activeLevel,
+                      rt.x + strafeX * bSpeed * 0.85 * simDt,
+                      rt.z + strafeZ * bSpeed * 0.85 * simDt,
+                      0.6,
+                      false,
+                      collisionCtx
+                    );
+                    rt.x = bx;
+                    rt.z = bz;
+                    movingBaddie = true;
+                    rt.walkPhase += simDt * 4.0;
+                  } else if (dist > 3.8) {
+                    const [bx, bz] = resolveHorizontalCollision(
+                      activeLevel,
+                      rt.x + dx * bSpeed * 0.85 * simDt,
+                      rt.z + dz * bSpeed * 0.85 * simDt,
+                      0.6,
+                      false,
+                      collisionCtx
+                    );
+                    rt.x = bx;
+                    rt.z = bz;
+                    movingBaddie = true;
+                    rt.walkPhase += simDt * 3.8;
+                  }
+                } else {
+                  const idealStopDist =
+                    canFly && (actionDef.category === 'breath' || actionDef.category === 'spell')
+                      ? 4.6
+                      : 1.45;
+                  if (dist > idealStopDist) {
+                    const flyChaseMult = canFly && rt.flightY > 0.35 ? 1.18 : 1.0;
+                    const [bx, bz] = resolveHorizontalCollision(
+                      activeLevel,
+                      rt.x + dx * bSpeed * flyChaseMult * simDt,
+                      rt.z + dz * bSpeed * flyChaseMult * simDt,
+                      0.6,
+                      false,
+                      collisionCtx
+                    );
+                    rt.x = bx;
+                    rt.z = bz;
+                    movingBaddie = true;
+                    rt.walkPhase += simDt * (bSpeed * 3.1);
+                  } else if (canFly && rt.flightY > 0.35) {
+                    // Hover strafe around hero when at optimal airborne breath distance
+                    rt.patrolAngle += simDt * 1.15;
+                    const strafeX = -dz * Math.cos(rt.patrolAngle * 0.5);
+                    const strafeZ = dx * Math.cos(rt.patrolAngle * 0.5);
+                    const [bx, bz] = resolveHorizontalCollision(
+                      activeLevel,
+                      rt.x + strafeX * bSpeed * 0.55 * simDt,
+                      rt.z + strafeZ * bSpeed * 0.55 * simDt,
+                      0.6,
+                      false,
+                      collisionCtx
+                    );
+                    rt.x = bx;
+                    rt.z = bz;
+                    movingBaddie = true;
+                    rt.walkPhase += simDt * 3.6;
+                  }
                 }
               } else {
                 rt.aiState = 'patrol';
-                const [bx, bz] = resolveHorizontalCollision(
-                  activeLevel,
-                  rt.x + rt.patrolDir * 1.45 * simDt,
-                  rt.z,
-                  0.6,
-                  false,
-                  collisionCtx
-                );
-                if (Math.abs(bx - rt.x) < 0.001 || Math.abs(bx - rt.startX) > 3.2) {
-                  rt.patrolDir *= -1;
+                const terrR = Math.max(3.5, aiCfg.territoryRadius);
+                if (canFly) {
+                  // Aerial flight pattern patrol around home territory
+                  rt.patrolAngle += simDt * (aiCfg.flightPattern === 'swoop' ? 0.82 : 0.65);
+                  const rad = Math.min(terrR * 0.65, 8.5);
+                  let goalX = rt.startX;
+                  let goalZ = rt.startZ;
+                  if (aiCfg.flightPattern === 'figure8') {
+                    goalX = rt.startX + Math.sin(rt.patrolAngle) * rad;
+                    goalZ = rt.startZ + Math.sin(rt.patrolAngle * 2) * (rad * 0.55);
+                    rt.targetFlightY = aiCfg.flightAltitude + Math.sin(rt.patrolAngle * 2) * 0.55;
+                  } else if (aiCfg.flightPattern === 'circle') {
+                    goalX = rt.startX + Math.cos(rt.patrolAngle) * rad;
+                    goalZ = rt.startZ + Math.sin(rt.patrolAngle) * rad;
+                    rt.targetFlightY = aiCfg.flightAltitude;
+                  } else if (aiCfg.flightPattern === 'swoop') {
+                    goalX = rt.startX + Math.cos(rt.patrolAngle) * rad;
+                    goalZ = rt.startZ + Math.sin(rt.patrolAngle) * (rad * 0.72);
+                    rt.targetFlightY =
+                      aiCfg.flightAltitude + Math.sin(rt.patrolAngle * 3) * 1.15;
+                  } else {
+                    goalX = rt.startX + Math.sin(rt.patrolAngle * 0.5) * 1.6;
+                    goalZ = rt.startZ + Math.cos(rt.patrolAngle * 0.5) * 1.6;
+                    rt.targetFlightY = aiCfg.flightAltitude + Math.sin(gameElapsed * 2.2) * 0.35;
+                  }
+                  const gdx = goalX - rt.x;
+                  const gdz = goalZ - rt.z;
+                  const gLen = Math.hypot(gdx, gdz);
+                  if (gLen > 0.12) {
+                    const step = Math.min(gLen, bSpeed * 0.85 * simDt);
+                    const [bx, bz] = resolveHorizontalCollision(
+                      activeLevel,
+                      rt.x + (gdx / gLen) * step,
+                      rt.z + (gdz / gLen) * step,
+                      0.6,
+                      false,
+                      collisionCtx
+                    );
+                    rt.x = bx;
+                    rt.z = bz;
+                    rt.mesh.rotation.y = Math.atan2(gdx, gdz);
+                    movingBaddie = true;
+                    rt.walkPhase += simDt * 4.4;
+                  }
+                } else {
+                  const pMode = aiCfg.patrolPattern;
+                  if (pMode === 'guard') {
+                    // Hold home post and scan gently left & right
+                    const homeDist = Math.hypot(rt.startX - rt.x, rt.startZ - rt.z);
+                    if (homeDist > 1.2) {
+                      const hx = (rt.startX - rt.x) / homeDist;
+                      const hz = (rt.startZ - rt.z) / homeDist;
+                      const [bx, bz] = resolveHorizontalCollision(
+                        activeLevel,
+                        rt.x + hx * 1.8 * simDt,
+                        rt.z + hz * 1.8 * simDt,
+                        0.6,
+                        false,
+                        collisionCtx
+                      );
+                      rt.x = bx;
+                      rt.z = bz;
+                      rt.mesh.rotation.y = Math.atan2(hx, hz);
+                      movingBaddie = true;
+                      rt.walkPhase += simDt * 4.2;
+                    } else {
+                      rt.mesh.rotation.y = Math.sin(gameElapsed * 0.75 + rt.patrolAngle) * 1.3;
+                    }
+                  } else if (pMode === 'orbit' || pMode === 'circuit' || pMode === 'wander') {
+                    rt.patrolAngle += simDt * (pMode === 'circuit' ? 0.55 : 0.48);
+                    const orbitR = Math.min(terrR * 0.55, 6.2);
+                    const tx =
+                      pMode === 'wander'
+                        ? rt.startX + Math.sin(rt.patrolAngle * 1.3) * orbitR
+                        : rt.startX + Math.cos(rt.patrolAngle) * orbitR;
+                    const tz =
+                      pMode === 'wander'
+                        ? rt.startZ + Math.cos(rt.patrolAngle * 0.85) * orbitR
+                        : rt.startZ + Math.sin(rt.patrolAngle) * orbitR;
+                    const pdx = tx - rt.x;
+                    const pdz = tz - rt.z;
+                    const pLen = Math.hypot(pdx, pdz);
+                    if (pLen > 0.15) {
+                      const [bx, bz] = resolveHorizontalCollision(
+                        activeLevel,
+                        rt.x + (pdx / pLen) * 1.75 * simDt,
+                        rt.z + (pdz / pLen) * 1.75 * simDt,
+                        0.6,
+                        false,
+                        collisionCtx
+                      );
+                      rt.x = bx;
+                      rt.z = bz;
+                      rt.mesh.rotation.y = Math.atan2(pdx, pdz);
+                      movingBaddie = true;
+                      rt.walkPhase += simDt * 4.6;
+                    }
+                  } else {
+                    const [bx, bz] = resolveHorizontalCollision(
+                      activeLevel,
+                      rt.x + rt.patrolDir * 1.55 * simDt,
+                      rt.z,
+                      0.6,
+                      false,
+                      collisionCtx
+                    );
+                    if (Math.abs(bx - rt.x) < 0.001 || Math.abs(bx - rt.startX) > Math.min(terrR * 0.5, 4.2)) {
+                      rt.patrolDir *= -1;
+                    }
+                    rt.x = bx;
+                    rt.z = bz;
+                    rt.mesh.rotation.y = rt.patrolDir > 0 ? Math.PI / 2 : -Math.PI / 2;
+                    movingBaddie = true;
+                    rt.walkPhase += simDt * 4.6;
+                  }
                 }
-                rt.x = bx;
-                rt.z = bz;
-                rt.mesh.rotation.y = rt.patrolDir > 0 ? Math.PI / 2 : -Math.PI / 2;
-                movingBaddie = true;
-                rt.walkPhase += simDt * 4.6;
+              }
+
+              // Smooth vertical flight altitude tracking when not dying
+              if (canFly && rt.aiState !== 'dying') {
+                rt.flightY = THREE.MathUtils.damp(rt.flightY, rt.targetFlightY, 4.4, dt);
+              } else if (!canFly) {
+                rt.flightY = 0;
               }
 
               // Animate articulated BaddieRig (windup raise, downward spear cleave, hit recoil, stride bob)
@@ -7901,20 +9788,34 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 let bobY = 0;
 
                 if (rt.aiState === 'dying') {
-                  targetPitch = -1.15;
+                  targetPitch = -1.25;
+                  targetRoll = 0.65;
                 } else if (rt.aiState === 'stagger') {
                   targetArmRX = -0.55;
                   targetArmRZ = 0.45;
                   targetArmLX = -0.55;
-                } else if (rt.aiState === 'windup') {
-                  const windupTotal = rt.isBoss ? 0.58 : 0.46;
-                  const wp = 1 - Math.max(0, rt.stateTimer / windupTotal);
-                  targetPitch = -0.26 * wp + rt.recoilPitch;
-                  targetArmRX = -1.92 * wp;
-                  targetArmRZ = 0.35 * wp;
-                  targetArmLX = 0.35 * wp;
+                } else if (rt.aiState === 'windup' || rt.aiState === 'landing') {
+                  const wp =
+                    rt.aiState === 'landing'
+                      ? 0.35
+                      : 1 - Math.max(0, rt.stateTimer / Math.max(0.05, windupTotal));
+                  if (rt.aiState === 'windup' && wp < 0.76) {
+                    const clueWave = Math.sin((wp / 0.76) * Math.PI * 6);
+                    bobY = Math.abs(clueWave) * 0.1;
+                    targetRoll = clueWave * 0.16 + rt.recoilRoll;
+                    targetPitch = -0.14 + Math.abs(clueWave) * 0.08 + rt.recoilPitch;
+                    targetArmRX = -0.55 + Math.abs(clueWave) * 0.45;
+                    targetArmRZ = 0.28 * Math.abs(clueWave);
+                    targetArmLX = clueWave * 0.48;
+                  } else {
+                    const pull = rt.aiState === 'landing' ? 0.35 : Math.min(1, (wp - 0.76) / 0.24);
+                    targetPitch = -0.34 * pull + rt.recoilPitch;
+                    targetArmRX = -2.05 * pull;
+                    targetArmRZ = 0.42 * pull;
+                    targetArmLX = 0.42 * pull;
+                  }
                 } else if (rt.aiState === 'strike') {
-                  const sp = 1 - Math.max(0, rt.stateTimer / 0.24);
+                  const sp = 1 - Math.max(0, rt.stateTimer / Math.max(0.05, strikeTotal));
                   targetPitch = 0.38 * Math.sin(sp * Math.PI) + rt.recoilPitch;
                   targetArmRX = THREE.MathUtils.lerp(-1.92, 1.05, Math.min(1, sp * 1.45));
                   targetArmRZ = THREE.MathUtils.lerp(0.35, -0.55, Math.min(1, sp * 1.45));
@@ -7938,7 +9839,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   const flap = Math.sin(gameElapsed * flapSpeed + rt.walkPhase) * 0.65;
                   if (bRig.wingL) bRig.wingL.rotation.z = 0.25 + flap;
                   if (bRig.wingR) bRig.wingR.rotation.z = -0.25 - flap;
-                  bRig.bodyPivot.position.y = 1.25 + Math.sin(gameElapsed * 3.5 + rt.walkPhase) * 0.14;
+                  bRig.bodyPivot.position.y = 0.45 + Math.sin(gameElapsed * 3.5 + rt.walkPhase) * 0.12;
                 } else {
                   bRig.bodyPivot.position.y = bobY;
                   if (bRig.armR) {
@@ -7953,7 +9854,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
 
                 // Enemy strike slash visual arc
                 if (rt.aiState === 'strike') {
-                  const sp = 1 - Math.max(0, rt.stateTimer / 0.24);
+                  const sp = 1 - Math.max(0, rt.stateTimer / Math.max(0.05, strikeTotal));
                   bRig.slashArc.visible = true;
                   bRig.slashArc.rotation.y = 0.7 - sp * 1.5;
                   bRig.slashMat.opacity = Math.sin(sp * Math.PI) * 0.75;
@@ -7966,13 +9867,16 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 const fwdZ = Math.cos(rt.mesh.rotation.y);
                 const hAhead = sampleLevelHeight(activeLevel, rt.x + fwdX * 0.6, rt.z + fwdZ * 0.6);
                 const hBehind = sampleLevelHeight(activeLevel, rt.x - fwdX * 0.6, rt.z - fwdZ * 0.6);
-                const slopePitch = qRig.canFly
-                  ? 0
-                  : THREE.MathUtils.clamp(-Math.atan2(hAhead - hBehind, 1.2), -0.45, 0.45);
+                const airborneFrac = qRig.canFly ? THREE.MathUtils.clamp(rt.flightY / 1.2, 0, 1) : 0;
+                const slopePitch =
+                  qRig.canFly && airborneFrac > 0.25
+                    ? 0
+                    : THREE.MathUtils.clamp(-Math.atan2(hAhead - hBehind, 1.2), -0.45, 0.45);
                 let qState: QuadrupedAnimState = 'idle';
                 let qProg = 0;
                 if (rt.aiState === 'dying') {
                   qState = 'dying';
+                  qProg = 1 - Math.max(0, rt.stateTimer / Math.max(0.1, rt.dyingDuration));
                 } else if (rt.aiState === 'stagger') {
                   qState = 'stagger';
                 } else if (rt.aiState === 'windup') {
@@ -7981,7 +9885,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 } else if (rt.aiState === 'strike') {
                   qState = 'strike';
                   qProg = 1 - Math.max(0, rt.stateTimer / Math.max(0.05, strikeTotal));
-                } else if (qRig.canFly) {
+                } else if (qRig.canFly && airborneFrac > 0.25) {
                   qState = 'fly';
                 } else if (movingBaddie && rt.aiState === 'chase') {
                   qState = 'run';
@@ -8008,7 +9912,9 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   rt.recoilRoll,
                   curAttack,
                   bMood,
-                  bMood
+                  bMood,
+                  airborneFrac,
+                  aiCfg.windupClueStyle
                 );
                 const showSlash =
                   rt.aiState === 'strike' &&
@@ -8033,7 +9939,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 }
               }
 
-              // Hit-flash (bright white-gold) and Attack-Windup telegraph glow (pulsing amber-red)
+              // Hit-flash (bright white-gold) and Attack-Windup telegraph glow (pulsing telegraph color)
               const flashMats = bRig
                 ? bRig.flashMaterials
                 : rt.quadrupedRig
@@ -8049,7 +9955,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   }
                 } else if (rt.aiState === 'windup') {
                   const pulse = 0.45 + 0.55 * Math.sin(gameElapsed * 26);
-                  _flashColor.set('#FF4A1C');
+                  _flashColor.set(actionDef.telegraphColor || '#FF4A1C');
                   for (const m of flashMats) {
                     m.emissive.copy(_flashColor);
                     m.emissiveIntensity = pulse * 0.75;
@@ -8066,48 +9972,41 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
 
               const ry = sampleLevelHeight(activeLevel, rt.x, rt.z) + (rt.elevationY ?? 0);
               const baseY = Math.max(-1, ry);
-              rt.mesh.position.set(rt.x, baseY + rt.yOffset, rt.z);
+              rt.mesh.position.set(rt.x, baseY + rt.yOffset + rt.flightY, rt.z);
 
-              // Floating overhead health bar when engaged in battle (or damaged)
+              // Dynamic key-colored overhead health bar with matching border & HP readout
               if (rt.hpBar) {
                 const bar = rt.hpBar;
                 const inBattle =
                   rt.aiState !== 'patrol' && rt.aiState !== 'dying'
                     ? true
-                    : rt.aiState !== 'dying' && rt.health < rt.maxHealth && dist < aggroRange + 4;
+                    : rt.aiState !== 'dying' && rt.health < rt.maxHealth && dist < aggroRange + 6;
                 const targetOpacity = inBattle ? 1 : 0;
                 bar.opacity = THREE.MathUtils.damp(bar.opacity, targetOpacity, inBattle ? 12 : 7, dt);
 
                 const hpRatio = THREE.MathUtils.clamp(rt.health / Math.max(1, rt.maxHealth), 0, 1);
-                bar.displayTrail = THREE.MathUtils.damp(bar.displayTrail, hpRatio, 5.5, dt);
+                if (bar.displayTrail < hpRatio) {
+                  bar.displayTrail = hpRatio;
+                } else {
+                  bar.displayTrail = THREE.MathUtils.damp(bar.displayTrail, hpRatio, 5.5, dt);
+                }
 
                 if (bar.opacity > 0.02) {
                   bar.group.visible = true;
-                  const flyHover = bRig?.isFlyer
-                    ? Math.sin(gameElapsed * 3.5 + rt.walkPhase) * 0.14
-                    : rt.quadrupedRig?.canFly
-                    ? 1.15 + Math.sin(gameElapsed * 3.4) * 0.16
-                    : 0;
-                  bar.group.position.set(rt.x, baseY + rt.yOffset + bar.heightOffset + flyHover, rt.z);
-                  bar.fillPivot.visible = hpRatio > 0.001;
-                  bar.fillPivot.scale.x = Math.max(0.0001, hpRatio);
-                  bar.trailPivot.visible = bar.displayTrail > 0.001;
-                  bar.trailPivot.scale.x = Math.max(0.0001, bar.displayTrail);
-
-                  bar.frameMat.opacity = bar.opacity * 0.88;
-                  bar.trackMat.opacity = bar.opacity * 0.92;
-                  bar.trailMat.opacity = bar.opacity * 0.9;
-                  bar.fillMat.opacity = bar.opacity;
-                  if (hpRatio <= 0.34) {
-                    bar.fillMat.color.set('#FF3B30');
-                  } else if (rt.isBoss) {
-                    bar.fillMat.color.set('#F59E0B');
-                  } else {
-                    bar.fillMat.color.set('#F2545B');
+                  const flyHover = canFly ? Math.sin(gameElapsed * 3.4 + rt.walkPhase) * 0.14 : 0;
+                  bar.group.position.set(
+                    rt.x,
+                    baseY + rt.yOffset + rt.flightY + bar.heightOffset + flyHover,
+                    rt.z
+                  );
+                  if (rt.keyFillColor) {
+                    bar.fillHex = rt.keyFillColor;
                   }
-                  for (const tm of bar.tickMats) {
-                    tm.opacity = bar.opacity * 0.62;
+                  if (rt.keyBorderColor) {
+                    bar.borderHex = rt.keyBorderColor;
                   }
+                  bar.mat.opacity = bar.opacity;
+                  redrawEnemyHealthBar(bar, rt.health, rt.maxHealth, bar.displayTrail);
                 } else {
                   bar.group.visible = false;
                 }
@@ -8133,6 +10032,14 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           if (doorPromptKey !== lastDoorPromptKey) {
             lastDoorPromptKey = doorPromptKey;
             setDoorInteractPrompt(nearestDoorPrompt);
+          }
+
+          const chestPromptKey = nearestChestPrompt
+            ? `${nearestChestPrompt.label}:${nearestChestPrompt.isOpen}:${nearestChestPrompt.locked}:${nearestChestPrompt.itemCount}`
+            : '';
+          if (chestPromptKey !== lastChestPromptKey) {
+            lastChestPromptKey = chestPromptKey;
+            setChestInteractPrompt(nearestChestPrompt);
           }
 
           // --- Live Camera Cutaways, Story Skits & Logic BehaviorCards ---
@@ -8608,10 +10515,15 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               nearestSitTarget ||
               isNearBenchNow ||
               nearestDoorPrompt ||
+              nearestChestPrompt ||
               nearestScatter ||
               nearInteractableEntity ||
               fishingState.phase !== 'idle'
           );
+          if (interactConsumed) {
+            shieldGuardTimer = 0;
+            interactConsumedLock = true;
+          }
 
           // Buddies Tavern Feast & Celebration Trigger
           if (isBuddies && buddyEntities.length > 0 && !tavernCelebrated) {
@@ -8669,7 +10581,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 const r = runtimeEntities[ri];
                 if (!r.alive) continue;
                 if (r.kind === 'baddie' && r.aiState !== 'dying') baddiesLeft++;
-                else if (r.kind === 'treasure') chestsLeft++;
+                else if (r.kind === 'treasure' && !r.opened) chestsLeft++;
               }
               let buddiesLeft = 0;
               for (let bi = 0; bi < buddyEntities.length; bi++) {
@@ -8882,7 +10794,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             }
 
             const heroPt = levelWorldToBoard(activeLevel, heroX, heroZ);
-            const stamRound = Math.round(stamina);
+            const stamRound = Math.round((stamina / maxStamina) * 100);
             const energyRound = Math.round(energy);
             const magicRound = Math.round(magic);
             const flashHp = hitInvuln > 0.7;
@@ -9548,10 +11460,15 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       disposed = true;
       sameLevelTravelFnRef.current = null;
       liveStatsGetterRef.current = null;
+      liveGrantCurrencyRef.current = () => {};
+      chestOpeningLockRef.current = false;
+      setIsChestOpeningAnim(false);
+      setActiveChestLoot(null);
       islandAbort?.abort();
       islandAbort = null;
       setHarvestPrompt(null);
       setDoorInteractPrompt(null);
+      setChestInteractPrompt(null);
       setSitPrompt(null);
       setClimbPrompt(null);
       setGlidePrompt(null);
@@ -9571,6 +11488,10 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
         fx.dispose();
       }
       monsterVfx.dispose();
+      heroEffects.dispose();
+      for (const rt of activeRuntimeEntities) {
+        rt.hpBar?.tex.dispose();
+      }
       scentPuffGeo.dispose();
       sonarRingGeo.dispose();
       revealBeaconGeo.dispose();
@@ -9713,13 +11634,18 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       celebrationBannerOpen: false,
     });
     setStoryStats({ puzzlesSolved: 0, crittersWarmed: 0 });
+    setHeroStatusBanner(null);
+    setBossVictoryBanner(null);
     store.resetRuntimeDurability();
     setInventoryStacks([
       { itemId: 'iron_sword', qty: 1, durability: 100, maxDurability: 100 },
+      { itemId: 'oak_shield', qty: 1, durability: 120, maxDurability: 120 },
+      { itemId: 'wood_axe', qty: 1, durability: 90, maxDurability: 90 },
       { itemId: 'parachute_blanket', qty: 1, durability: 100, maxDurability: 100 },
     ]);
     setEquipment({
       heldItemId: 'iron_sword',
+      offhandItemId: 'oak_shield',
       headItemId: null,
       bodyItemId: null,
       accessoryItemId: null,
@@ -9847,6 +11773,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     !panelPausesMovement &&
     !inventoryOpen &&
     !worldMapOpen &&
+    !activeChestLoot &&
     fastTravelState === null;
 
   return (
@@ -10414,8 +12341,47 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
         </div>
       )}
 
+      {/* Treasure Chest Interaction Prompt */}
+      {controlsActive &&
+        !isChestOpeningAnim &&
+        chestInteractPrompt &&
+        !nearCraftingBench &&
+        !harvestPrompt && (
+          <div
+            className={`fixed ${
+              unlockedPowers.length > 0 ? 'bottom-32' : 'bottom-24'
+            } left-1/2 -translate-x-1/2 px-4 py-2 rounded-xl bg-[#141722]/94 border border-[#FACC15]/55 text-white text-xs font-extrabold shadow-xl z-30 flex items-center gap-2 whitespace-nowrap`}
+          >
+            <PackageOpen size={15} className="text-[#FACC15]" />
+            <span>
+              {chestInteractPrompt.locked ? (
+                <>
+                  {chestInteractPrompt.lockedMessage || (
+                    <>
+                      <span className="text-[#FACC15]">{chestInteractPrompt.label}</span> is locked — find a key!
+                    </>
+                  )}
+                </>
+              ) : chestInteractPrompt.isOpen ? (
+                <>
+                  Press <span className="px-1.5 py-0.5 mx-0.5 rounded bg-white/15 font-mono text-[11px]">E</span> to check{' '}
+                  <span className="text-[#FACC15]">{chestInteractPrompt.label}</span>{' '}
+                  <span className="text-amber-200/80 font-bold">
+                    ({chestInteractPrompt.itemCount} left)
+                  </span>
+                </>
+              ) : (
+                <>
+                  Press <span className="px-1.5 py-0.5 mx-0.5 rounded bg-white/15 font-mono text-[11px]">E</span> (Use) to open{' '}
+                  <span className="text-[#FACC15]">{chestInteractPrompt.label}</span>
+                </>
+              )}
+            </span>
+          </div>
+        )}
+
       {/* Door / Trapdoor Interaction Prompt */}
-      {controlsActive && doorInteractPrompt && !nearCraftingBench && !harvestPrompt && (
+      {controlsActive && doorInteractPrompt && !chestInteractPrompt && !nearCraftingBench && !harvestPrompt && (
         <div
           className={`fixed ${
             unlockedPowers.length > 0 ? 'bottom-32' : 'bottom-24'
@@ -10459,7 +12425,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       )}
 
       {/* Sit / Stand Prompt */}
-      {controlsActive && sitPrompt && !nearCraftingBench && !doorInteractPrompt && !harvestPrompt && (
+      {controlsActive && sitPrompt && !chestInteractPrompt && !nearCraftingBench && !doorInteractPrompt && !harvestPrompt && (
         <div
           className={`fixed ${
             unlockedPowers.length > 0 ? 'bottom-32' : 'bottom-24'
@@ -10484,7 +12450,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       )}
 
       {/* Climb Prompt */}
-      {controlsActive && climbPrompt && !sitPrompt && !nearCraftingBench && !doorInteractPrompt && !harvestPrompt && (
+      {controlsActive && climbPrompt && !sitPrompt && !chestInteractPrompt && !nearCraftingBench && !doorInteractPrompt && !harvestPrompt && (
         <div
           className={`fixed ${
             unlockedPowers.length > 0 ? 'bottom-32' : 'bottom-24'
@@ -10656,6 +12622,54 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
         </div>
       )}
 
+      {/* Active Hero Combat Status Indicator */}
+      {controlsActive && heroStatusBanner && (
+        <div
+          className={`fixed top-16 left-1/2 -translate-x-1/2 px-3.5 py-1.5 rounded-xl border text-xs font-extrabold shadow-lg z-30 flex items-center gap-2 whitespace-nowrap ${
+            heroStatusBanner.kind === 'burn'
+              ? 'bg-orange-950/90 border-orange-400/60 text-orange-200'
+              : heroStatusBanner.kind === 'freeze'
+              ? 'bg-sky-950/90 border-sky-300/60 text-sky-100'
+              : heroStatusBanner.kind === 'shock'
+              ? 'bg-amber-950/90 border-yellow-300/60 text-yellow-100'
+              : heroStatusBanner.kind === 'poison'
+              ? 'bg-emerald-950/90 border-emerald-400/60 text-emerald-100'
+              : 'bg-stone-900/92 border-amber-400/50 text-amber-100'
+          }`}
+        >
+          <Flame size={13} />
+          <span>{heroStatusBanner.label}</span>
+        </div>
+      )}
+
+      {/* Active Terrain / Temperature / Environment Trait Indicator */}
+      {controlsActive && heroTraitBanner && !heroStatusBanner && (
+        <div
+          className={`fixed top-16 left-1/2 -translate-x-1/2 px-3 py-1 rounded-xl border text-[11px] font-bold shadow-md z-25 whitespace-nowrap ${
+            heroTraitBanner.tone === 'strength'
+              ? 'bg-emerald-950/85 border-emerald-400/50 text-emerald-100'
+              : 'bg-rose-950/85 border-rose-400/50 text-rose-100'
+          }`}
+        >
+          {heroTraitBanner.label}
+        </div>
+      )}
+
+      {/* Boss Victory Banner */}
+      {controlsActive && bossVictoryBanner && (
+        <div className="fixed top-28 left-1/2 -translate-x-1/2 px-5 py-3 rounded-2xl bg-[#141722]/95 border border-[#FACC15]/70 text-white shadow-2xl z-30 flex items-center gap-3">
+          <Sparkles size={18} className="text-[#FACC15]" />
+          <div>
+            <div className="text-xs font-black uppercase tracking-wider text-[#FACC15]">
+              Boss Vanquished!
+            </div>
+            <div className="text-xs font-bold text-white/90">
+              {bossVictoryBanner.bossName} defeated — open the Great Treasure Chest!
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Toast message */}
       {toast && (
         <div className="fixed top-18 left-1/2 -translate-x-1/2 px-4 py-2 rounded-xl bg-[#171A23]/95 border border-white/10 text-white text-xs font-bold shadow-lg z-30">
@@ -10710,6 +12724,17 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           onCraftRecipe={handleCraftRecipe}
           onRepairItem={handleRepairItem}
           onClose={() => setInventoryOpen(false)}
+        />
+      )}
+
+      {/* Treasure Chest Contents Selection Modal */}
+      {activeChestLoot && !showTitle && !dead && !finished && (
+        <ChestLootModal
+          chestName={activeChestLoot.chestName}
+          entries={activeChestLoot.entries}
+          onTakeEntry={handleTakeChestEntry}
+          onTakeAll={handleTakeAllChestEntries}
+          onClose={() => setActiveChestLoot(null)}
         />
       )}
 

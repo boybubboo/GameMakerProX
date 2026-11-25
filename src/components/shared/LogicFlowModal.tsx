@@ -21,6 +21,7 @@ import {
   EntityKindMeta,
   ruleSentence,
 } from '../../data/registries';
+import { BADDIE_ACTION_LIBRARY, FLIGHT_PATTERN_OPTIONS } from '../../data/baddieActionLibrary';
 import type { MakerStore } from '../../store/useMakerStore';
 import type { BehaviorCard, CardClause, LevelEntity } from '../../types/maker';
 import { uid } from '../../utils/terrain';
@@ -244,8 +245,9 @@ export const LogicFlowWorkspace: React.FC<LogicFlowWorkspaceProps> = ({
             detail: 'Add at least one action so this trigger produces an effect.',
           });
         }
+        const optionalWhenDetail = card.when.key === 'seesPlayer' || card.when.key === 'playerNear';
         const whenDef = BehaviorVocabulary.events.find((e) => e.key === card.when.key);
-        if (whenDef?.needsDetail && !card.when.detail.trim()) {
+        if (whenDef?.needsDetail && !optionalWhenDetail && !card.when.detail.trim()) {
           list.push({
             id: `wdetail:${card.id}`,
             severity: 'warning',
@@ -305,8 +307,10 @@ export const LogicFlowWorkspace: React.FC<LogicFlowWorkspaceProps> = ({
 
         for (const act of card.actions) {
           const actNodeId = `then:${ent.id}:${card.id}:${act.id}`;
+          const optionalActDetail =
+            act.key === 'attack' || act.key === 'flyPattern' || act.key === 'landAndAttack';
           const actDef = BehaviorVocabulary.actions.find((a) => a.key === act.key);
-          if (actDef?.needsDetail && !act.detail.trim()) {
+          if (actDef?.needsDetail && !optionalActDetail && !act.detail.trim()) {
             list.push({
               id: `adetail:${act.id}`,
               severity: 'warning',
@@ -1925,6 +1929,13 @@ export const LogicFlowWorkspace: React.FC<LogicFlowWorkspaceProps> = ({
                                       type="text"
                                       value={act.detail}
                                       placeholder={def.detailHint}
+                                      list={
+                                        act.key === 'attack' || act.key === 'landAndAttack'
+                                          ? 'flow-baddie-action-list'
+                                          : act.key === 'flyPattern'
+                                            ? 'flow-baddie-flight-list'
+                                            : undefined
+                                      }
                                       onChange={(e) =>
                                         updateSelectedCard(
                                           selectedEntity.id,
@@ -1946,6 +1957,20 @@ export const LogicFlowWorkspace: React.FC<LogicFlowWorkspaceProps> = ({
                                 </div>
                               );
                             })}
+                            <datalist id="flow-baddie-action-list">
+                              {BADDIE_ACTION_LIBRARY.map((a) => (
+                                <option key={a.id} value={a.id}>
+                                  {a.label}
+                                </option>
+                              ))}
+                            </datalist>
+                            <datalist id="flow-baddie-flight-list">
+                              {FLIGHT_PATTERN_OPTIONS.map((f) => (
+                                <option key={f.id} value={f.id}>
+                                  {f.label}
+                                </option>
+                              ))}
+                            </datalist>
                           </div>
                         </>
                       )}

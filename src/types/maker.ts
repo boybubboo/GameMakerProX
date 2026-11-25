@@ -61,7 +61,74 @@ export type CustomClipSlot =
   | 'bowPull'
   | 'hug'
   | 'punch'
-  | 'kick';
+  | 'kick'
+  // Hero defense, combat reactions & celebration
+  | 'block'
+  | 'parry'
+  | 'knockdown'
+  | 'getUp'
+  | 'hurt'
+  | 'die'
+  | 'celebrate'
+  | 'wave'
+  | 'dance'
+  // NPC & Buddy expressions / misfit skills
+  | 'talk'
+  | 'laugh'
+  | 'cheer'
+  | 'shy'
+  | 'grumpy'
+  | 'misfitPower'
+  // Enemies, Flyers & Bosses (windup clues, attacks, reactions & death)
+  | 'fly'
+  | 'windup_headSway3'
+  | 'windup_footMarch'
+  | 'windup_wingFlare'
+  | 'windup_crouchPounce'
+  | 'fireBreath'
+  | 'iceBreath'
+  | 'waterJet'
+  | 'electricShock'
+  | 'poisonSpit'
+  | 'shadowBeam'
+  | 'solarBeam'
+  | 'groundPound'
+  | 'clawSlash'
+  | 'tailSmash'
+  | 'chargeGore'
+  | 'sonicRoar'
+  | 'stagger'
+  | 'dying';
+
+export type MotionActorCategory = 'hero' | 'npc' | 'buddy' | 'enemy';
+
+export type MotionRigArchetype = 'humanoid' | 'critter' | 'quadruped' | 'baddie';
+
+export type MotionEventKind = 'windupLock' | 'impactStart' | 'impactEnd' | 'footstep' | 'grounded';
+
+export interface MotionEventMarker {
+  id: string;
+  time: number; // normalized [0, 1]
+  kind: MotionEventKind;
+  label?: string;
+}
+
+export type MotionActorTarget =
+  | { kind: 'builtInHero'; category: 'hero'; label: string }
+  | { kind: 'customAsset'; category: MotionActorCategory; assetId: string; label: string }
+  | { kind: 'proceduralNpc'; category: 'npc'; entityId?: string; label: string }
+  | { kind: 'buddyCritter'; category: 'buddy'; creatureType: CreatureBodyId; entityId?: string; label: string }
+  | { kind: 'proceduralBaddie'; category: 'enemy'; variant: 'ground' | 'flyer' | 'boss'; entityId?: string; label: string }
+  | { kind: 'monsterBlueprint'; category: 'enemy'; monsterId: string; entityId?: string; label: string };
+
+export type MotionAssignmentScope =
+  | 'heroDefault'
+  | 'npcDefault'
+  | 'buddyDefault'
+  | 'baddieDefault'
+  | 'monsterBlueprint'
+  | 'entityOverride'
+  | 'customAsset';
 
 export type RigBoneRole =
   | 'hips'
@@ -135,6 +202,12 @@ export interface CustomMotionPreset {
   easing: MotionEasing;
   keyframes: CustomPoseKeyframe[];
   updatedAt: string;
+  /** Optional Universal Motion Studio provenance & retargeting metadata */
+  actorCategory?: MotionActorCategory;
+  rigArchetype?: MotionRigArchetype;
+  hipsHeightRef?: number;
+  sourcePresetId?: string;
+  events?: MotionEventMarker[];
 }
 
 export interface SavedPosePreset {
@@ -1420,6 +1493,11 @@ export interface LevelEntity {
   doorConfig?: DoorConfig;
   // Quadruped / Multi-Legged Animal & Fantastical Monster Blueprint
   monsterConfig?: MonsterBlueprint;
+  // Extensible Baddie / Boss Combat AI, Territory, Flight & Action Library Config
+  baddieAI?: BaddieAIConfig;
+  // Per-entity custom motion overrides & saved variations
+  motionSlotOverrides?: Partial<Record<CustomClipSlot, string>>;
+  motionCustomAnimations?: CustomMotionPreset[];
   // WebGPU r187 pipeline & zero-stutter material variant overrides
   meshletEnabled?: boolean;
   materialVariant?: EntityMaterialVariant;
@@ -2000,6 +2078,7 @@ export interface GameProject {
   heroModelOffsetY?: number;
   heroAnimSpeed?: number;
   heroChatBubble?: ChatBubbleStyle;
+  heroProfile?: HeroProfileConfig;
   chatSettings?: ChatDisplaySettings;
   enabledActions: string[];
   hud: HUDProfile;
@@ -2010,6 +2089,14 @@ export interface GameProject {
   postProcessing?: PostProcessingConfig;
   storybook?: StorybookConfig;
   customMonsters?: MonsterBlueprint[];
+  /** Universal Motion Studio project-wide variation library & slot defaults */
+  customMotionLibrary?: CustomMotionPreset[];
+  customPoseLibrary?: SavedPosePreset[];
+  heroMotionSlots?: Partial<Record<CustomClipSlot, string>>;
+  npcMotionSlots?: Partial<Record<CustomClipSlot, string>>;
+  buddyMotionSlots?: Partial<Record<CustomClipSlot, string>>;
+  buddyMotionSlotsByCreature?: Partial<Record<CreatureBodyId, Partial<Record<CustomClipSlot, string>>>>;
+  baddieMotionSlots?: Partial<Record<CustomClipSlot, string>>;
   coverTagline: string;
   difficulty: 'Easy' | 'Normal' | 'Tricky';
   published: boolean;
@@ -2129,7 +2216,7 @@ export type InventoryItemCategory =
   | 'resource'
   | 'material';
 export type ToolActionKind = 'sword' | 'axe' | 'fishingPole' | 'torch';
-export type WearSlot = 'head' | 'body' | 'accessory';
+export type WearSlot = 'head' | 'body' | 'accessory' | 'offhand';
 export type ItemRarity = 'common' | 'uncommon' | 'rare' | 'epic' | 'legendary';
 export type PickupMeshKind =
   | 'sword'
@@ -2145,6 +2232,7 @@ export type PickupMeshKind =
   | 'hat'
   | 'cloak'
   | 'armor'
+  | 'shield'
   | 'amulet'
   | 'torch'
   | 'staff'
@@ -2184,8 +2272,10 @@ export interface InventoryItemDef {
   magicEffect?: string;
   meshKind: PickupMeshKind;
   toolKind?: ToolActionKind;
+  handedness?: 'oneHand' | 'twoHand';
   wearSlot?: WearSlot;
   wearColorHex?: string;
+  blockReduction?: number;
   healAmount?: number;
   staminaAmount?: number;
   magicAmount?: number;
@@ -2268,6 +2358,7 @@ export interface InventoryStack {
 
 export interface HeroEquipment {
   heldItemId: string | null;
+  offhandItemId?: string | null;
   headItemId: string | null;
   bodyItemId: string | null;
   accessoryItemId: string | null;
@@ -3296,6 +3387,32 @@ export type MonsterAbilityId =
   | 'berserk'
   | 'regenerator';
 
+export type BaddieDetectionMode = 'spatial' | 'sight' | 'both';
+export type BaddiePatrolPattern = 'pace' | 'wander' | 'orbit' | 'circuit' | 'guard';
+export type BaddieFlightPattern = 'hover' | 'circle' | 'figure8' | 'swoop';
+export type BaddieWindupClueStyle = 'auto' | 'headSway3' | 'footMarch' | 'wingFlare' | 'crouchPounce';
+export type BaddieHeroEffectKind = 'none' | 'knockdown' | 'burn' | 'freeze' | 'shock' | 'poison' | 'soak' | 'stun';
+export type HeroStatusEffectKind = 'burn' | 'freeze' | 'shock' | 'poison' | 'soak';
+
+export interface BaddieAIConfig {
+  detectionMode: BaddieDetectionMode;
+  aggroRange: number;
+  sightAngleDeg: number;
+  territoryRadius: number;
+  patrolPattern: BaddiePatrolPattern;
+  flightPattern: BaddieFlightPattern;
+  flightAltitude: number;
+  hoverAttackHeight: number;
+  landAfterAirAttack?: boolean; // when true, flying baddies perform 1 air attack, hover briefly, then land before attacking again
+  windupClueStyle?: BaddieWindupClueStyle;
+  varietyFactor: number; // 0..1 randomness in attack choice, cadence & approach
+  primaryAction: MonsterAttackType;
+  secondaryAction: MonsterAttackType;
+  actionPool?: MonsterAttackType[];
+  bossRewardCoins?: number;
+  bossRewardItems?: string[];
+}
+
 export interface MonsterSegmentProfile {
   startRadius: number;
   midRadius: number;
@@ -3545,7 +3662,83 @@ export interface MonsterBlueprint {
   attackPower?: number;
   attackRange?: number;
   attackCooldown?: number;
+  /** Extensible AI behavior, territory, flight pattern & action library overrides */
+  baddieAI?: BaddieAIConfig;
+  /** Custom authored motion presets & slot overrides assigned directly to this monster/boss */
+  customAnimations?: CustomMotionPreset[];
+  defaultSlotPresets?: Partial<Record<CustomClipSlot, string>>;
 }
+
+export type HeroAffinityRating = -2 | -1 | 0 | 1 | 2;
+
+export type HeroSkillId =
+  | 'powerStrike'
+  | 'swiftFootwork'
+  | 'mountainClimber'
+  | 'aquaLung'
+  | 'ironResolve'
+  | 'elementalWard'
+  | 'giantSlayer'
+  | 'acrobat'
+  | 'frostBitten'
+  | 'heatExhausted'
+  | 'heavyArmorClumsy'
+  | 'glassCannon';
+
+export interface HeroStatsConfig {
+  maxHealth: number; // 3..20
+  baseAttack: number; // 1..8
+  baseDefense: number; // 0..5
+  moveSpeedMult: number; // 0.65..1.5
+  jumpPowerMult: number; // 0.75..1.45
+  staminaMax: number; // 60..160
+  staminaRegenMult: number; // 0.6..1.8
+  magicPower: number; // 1..8
+  dodgeInvulnMult: number; // 0.7..1.5
+}
+
+export interface HeroTerrainAffinities {
+  grassland: HeroAffinityRating;
+  sandAndCoast: HeroAffinityRating;
+  rockAndAlpine: HeroAffinityRating;
+  mudAndSwamp: HeroAffinityRating;
+  snowAndIce: HeroAffinityRating;
+  waterAndSwim: HeroAffinityRating;
+}
+
+export interface HeroTemperatureProfile {
+  preferredTemp: 'cold' | 'temperate' | 'warm';
+  coldResistance: HeroAffinityRating;
+  heatResistance: HeroAffinityRating;
+}
+
+export interface HeroEnemyMatchups {
+  bosses: HeroAffinityRating;
+  flying: HeroAffinityRating;
+  beasts: HeroAffinityRating;
+  elemental: HeroAffinityRating;
+  heavyBrutes: HeroAffinityRating;
+}
+
+export interface HeroEnvironmentAffinities {
+  openWilds: HeroAffinityRating;
+  underground: HeroAffinityRating;
+  stormAndRain: HeroAffinityRating;
+  nightAndShadow: HeroAffinityRating;
+  highAltitude: HeroAffinityRating;
+}
+
+export interface HeroProfileConfig {
+  archetype?: string;
+  bio?: string;
+  stats: HeroStatsConfig;
+  skills: HeroSkillId[];
+  terrain: HeroTerrainAffinities;
+  temperature: HeroTemperatureProfile;
+  enemies: HeroEnemyMatchups;
+  environments: HeroEnvironmentAffinities;
+}
+
 
 
 
